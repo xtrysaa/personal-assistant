@@ -1,0 +1,22 @@
+# секреты
+.env
+
+# база данных и её служебные файлы
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.venv*/
+*.egg-info/
+
+# ide / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

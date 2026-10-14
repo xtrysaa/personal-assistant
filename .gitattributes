@@ -1,0 +1,10 @@
+# Нормализация переводов строк: на Windows файлы могут быть CRLF,
+# а бот разворачивается на Linux. eol=lf гарантирует, что в репозитории
+# и на сервере лежат LF — иначе systemd/python получают файлы с \r\n.
+* text=auto eol=lf
+
+# Бинарные файлы не трогаем
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
