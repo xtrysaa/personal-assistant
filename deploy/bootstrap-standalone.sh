@@ -59,6 +59,20 @@ fi
 free -m | tail -2
 
 # --------------------------------------------------------------------------- #
+log "2b. dnf-makecache выключить (он роняет машину по памяти)"
+# Таймер раз в час тянет метаданные репозиториев и съедает ~350 МБ. На машине
+# с 498 МБ это глобальный OOM: ядро убивает dnf, а вместе с ним встаёт вся VM —
+# бот ловит таймаут Telegram и выглядит упавшим. Метаданные здесь не нужны:
+# развёртывание идёт без dnf.
+if systemctl list-unit-files 2>/dev/null | grep -q '^dnf-makecache.timer'; then
+    sudo systemctl disable --now dnf-makecache.timer >/dev/null 2>&1 || true
+    sudo systemctl mask dnf-makecache.timer dnf-makecache.service >/dev/null 2>&1 || true
+    echo "dnf-makecache.timer отключён и замаскирован"
+else
+    echo "dnf-makecache.timer не найден — пропускаю"
+fi
+
+# --------------------------------------------------------------------------- #
 log "3. Python ${PY_SERIES} готовой сборкой -> $PY_ROOT"
 if [ -x "$PY_ROOT/bin/python3" ] && "$PY_ROOT/bin/python3" --version >/dev/null 2>&1; then
     echo "уже установлен: $("$PY_ROOT/bin/python3" --version 2>&1)"

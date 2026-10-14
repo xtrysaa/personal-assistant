@@ -396,6 +396,41 @@ journalctl -u assistant-bot -f             # живой лог (Ctrl+C — вы�
 
 Всё: бот работает 24/7 и сам поднимется после перезагрузки сервера.
 
+### 4.5.1. Если бот «перестал отвечать»: проверить память первым делом
+
+На Oracle Always Free у машины **498 МБ RAM**, и самый частый виновник простоя —
+не бот, а системный `dnf-makecache.timer`: раз в час он тянет метаданные
+репозиториев, берёт ~350 МБ и приводит к **global OOM**. Ядро убивает `dnf`,
+но вместе с ним на несколько минут встаёт вся машина: Telegram-опрос получает
+таймаут, и со стороны это выглядит как «бот умер». Процесс бота при этом жив
+и перезапусков не набирает.
+
+Диагностика в таком случае смотрится так:
+
+```bash
+systemctl show assistant-bot -p ActiveState -p NRestarts -p OOMScoreAdjust
+free -m                                    # сколько съел своп
+cat /proc/loadavg                          # load 15+ при одном ядре — тревожный знак
+sudo journalctl -k --since '-24h' | grep -E 'Out of memory|Killed process'
+sudo journalctl -u assistant-bot --since '-60min' | grep -i 'Request timeout'
+```
+
+Лечится один раз и навсегда:
+
+```bash
+sudo systemctl disable --now dnf-makecache.timer
+sudo systemctl mask dnf-makecache.timer dnf-makecache.service
+sudo systemctl reset-failed dnf-makecache.service
+```
+
+`deploy/bootstrap-standalone.sh` делает это сам (шаг 2b), а в юните стоит
+`OOMScoreAdjust=-500` — если памяти однажды всё же не хватит, ядро выберет
+жертву не среди бота. Посмотреть, кто ещё просыпается по таймеру, можно так:
+
+```bash
+systemctl list-timers --all
+```
+
 ### 4.6. Обновить код на сервере
 
 ```bash
