@@ -51,6 +51,23 @@ def _parse_hhmm(raw: str, name: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _optional_hhmm(name: str, default: str) -> tuple[int, int] | None:
+    """Время из необязательной переменной, где «не задана» и «пустая» — разное.
+
+    `_optional` схлопывает оба случая в одно значение, а здесь нужна разница:
+    отсутствие `EVENING_CHECKIN_TIME` означает «работай как обычно» (21:30),
+    а явно пустое значение — «выключи вечерний чек-ин». Поэтому читаем
+    окружение напрямую.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return _parse_hhmm(default, name)
+    raw = raw.strip()
+    if not raw:
+        return None
+    return _parse_hhmm(raw, name)
+
+
 def _parse_offsets(raw: str) -> tuple[int, ...]:
     """Разобрать список смещений напоминаний: '10080,1440,60' -> (10080, 1440, 60)."""
     offsets: list[int] = []
@@ -88,6 +105,7 @@ class Settings:
     db_path: str
     default_offsets: tuple[int, ...]
     digest: tuple[int, int] | None
+    evening: tuple[int, int] | None
     weekly_day: str | None
     weekly_time: tuple[int, int] | None
     health_port: int | None
@@ -115,6 +133,10 @@ def get_settings() -> Settings:
 
     digest_raw = _optional("DAILY_DIGEST_TIME")
     digest = _parse_hhmm(digest_raw, "DAILY_DIGEST_TIME") if digest_raw else None
+
+    # Вечерний чек-ин: итог дня и приглашение записать часы подготовки.
+    # По умолчанию включён, пустое значение — выключен.
+    evening = _optional_hhmm("EVENING_CHECKIN_TIME", "21:30")
 
     weekly_day = _optional("WEEKLY_REVIEW_DAY").lower() or None
     if weekly_day and weekly_day not in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}:
@@ -164,6 +186,7 @@ def get_settings() -> Settings:
         db_path=_optional("DB_PATH", "./data/assistant.db"),
         default_offsets=_parse_offsets(_optional("DEFAULT_REMIND_OFFSETS", "10080,1440,60")),
         digest=digest,
+        evening=evening,
         weekly_day=weekly_day,
         weekly_time=weekly_time,
         health_port=health_port,

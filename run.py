@@ -30,6 +30,8 @@ COMMANDS = [
     BotCommand(command="overdue", description="Просроченное"),
     BotCommand(command="add", description="Добавить дело текстом"),
     BotCommand(command="plan", description="Помочь распланировать"),
+    BotCommand(command="progress", description="Подготовка: баллы и часы"),
+    BotCommand(command="export", description="Выгрузить календарь (.ics)"),
     BotCommand(command="done", description="Отметить выполненным: /done 12"),
     BotCommand(command="del", description="Удалить задачу: /del 12"),
     BotCommand(command="reset", description="Сбросить контекст диалога"),
@@ -47,7 +49,11 @@ async def main() -> None:
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
     settings = get_settings()
-    await db.init_db(settings.db_path)
+    # Часовой пояс и смещения напоминаний нужны самой базе: она считает
+    # следующую дату повторяющейся серии и подставляет напоминания по умолчанию.
+    await db.init_db(
+        settings.db_path, tz=settings.tz, default_offsets=settings.default_offsets
+    )
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()

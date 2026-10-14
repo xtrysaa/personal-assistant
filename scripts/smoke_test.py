@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 # Скрипт лежит в scripts/, а пакет bot — в корне проекта.
@@ -32,8 +33,46 @@ os.environ.update(
     DEFAULT_REMIND_OFFSETS="10080,1440,60",
 )
 
-from bot import db, formatting, llm, timeutil  # noqa: E402
+from bot import calendar_export, db, formatting, llm, progress, recurrence, timeutil  # noqa: E402
 from bot.config import get_settings  # noqa: E402
+
+# Схема ДО появления новых фич: колонки recurrence и таблицы progress ещё нет.
+# Нужна, чтобы проверить миграции на копии боевой базы, а не на свежей —
+# на свежей базе ошибка в порядке применения миграций не проявляется.
+LEGACY_SCHEMA = """
+CREATE TABLE tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT    NOT NULL,
+    details      TEXT,
+    due_at       TEXT,
+    category     TEXT    NOT NULL DEFAULT 'other',
+    priority     TEXT    NOT NULL DEFAULT 'normal',
+    status       TEXT    NOT NULL DEFAULT 'open',
+    source       TEXT    NOT NULL DEFAULT 'chat',
+    created_at   TEXT    NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE reminders (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    offset_minutes INTEGER NOT NULL,
+    fire_at        TEXT    NOT NULL,
+    sent_at        TEXT
+);
+
+CREATE UNIQUE INDEX idx_reminders_task_offset ON reminders (task_id, offset_minutes);
+
+CREATE TABLE history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_tasks_status_due  ON tasks (status, due_at);
+CREATE INDEX idx_reminders_pending ON reminders (sent_at, fire_at);
+"""
 
 # Windows-консоль по умолчанию cp1251 — иначе кириллица выглядит кракозябрами.
 if hasattr(sys.stdout, "reconfigure"):
@@ -55,6 +94,15 @@ def section(title: str) -> None:
 def iso_local(moment: datetime, tz) -> str:
     """Локальное время пользователя в формате, который просим у модели."""
     return moment.astimezone(tz).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _raises(call) -> bool:
+    """True, если вызов упал ожидаемой ошибкой валидации."""
+    try:
+        call()
+    except (ValueError, TypeError):
+        return True
+    return False
 
 
 async def main() -> None:
@@ -250,6 +298,251 @@ async def main() -> None:
           [item["role"] for item in history] == ["user", "assistant"], str(history))
     await db.clear_history()
     check("сброс истории", await db.get_history(limit=5) == [])
+
+    # ------------------------------------------------------------------ #
+    section("8. Подготовка: баллы и часы")
+    score = await llm.execute_tool("log_score", {"subject": "sat", "value": 640})
+    check("балл пробника записан", score.get("ok") is True, str(score))
+    check("шкала SAT подставлена автоматически",
+          score["entry"]["scale"] == 1600, str(score["entry"]))
+
+    synonym = await llm.execute_tool("log_score", {"subject": "математика", "value": "680"})
+    check("синоним «математика» и строка вместо числа",
+          synonym["entry"]["subject"] == "Математика" and synonym["entry"]["value"] == 680.0,
+          str(synonym["entry"]))
+
+    grown = await llm.execute_tool("log_score", {"subject": "sat", "value": 700})
+    check("второй балл по предмету принят", grown.get("ok") is True, str(grown))
+
+    too_big = await llm.execute_tool("log_score", {"subject": "sat", "value": 2000})
+    check("балл выше шкалы отклонён",
+          too_big.get("ok") is False and "максимума" in too_big.get("error", ""), str(too_big))
+
+    unknown = await llm.execute_tool("log_score", {"subject": "физра", "value": 100})
+    check("незнакомый предмет отклонён",
+          unknown.get("ok") is False and "Неизвестный предмет" in unknown.get("error", ""),
+          str(unknown))
+
+    hours = await llm.execute_tool("log_hours", {"subject": "math", "hours": 2.5})
+    check("часы записаны", hours.get("ok") is True and hours["entry"]["display"] == "2.5 часа",
+          str(hours))
+
+    await llm.execute_tool("log_hours", {"subject": "english", "hours": 1})
+    long_ago = (datetime.now(tz) - timedelta(days=40)).strftime("%Y-%m-%d")
+    await llm.execute_tool("log_hours", {"subject": "math", "hours": 3, "occurred_on_local": long_ago})
+
+    impossible = await llm.execute_tool("log_hours", {"subject": "math", "hours": 26})
+    check("26 часов за раз отклонены",
+          impossible.get("ok") is False and "24 часа" in impossible.get("error", ""), str(impossible))
+
+    report = await llm.execute_tool("get_progress", {})
+    check("часы за окно посчитаны, старое не попало",
+          report["hours_total"] == 3.5, str(report["hours_total"]))
+    check("динамика SAT +60 к прошлому",
+          report["scores"]["sat"]["delta"] == 60.0, str(report["scores"]["sat"]))
+
+    text = progress.build_report(
+        await db.list_progress(),
+        since=(datetime.now(tz) - timedelta(days=6)).strftime("%Y-%m-%d"),
+        until=datetime.now(tz).strftime("%Y-%m-%d"),
+    )
+    check("отчёт содержит полосу и динамику",
+          "█" in text and "+60 к прошлому" in text and "2.5 часа" in text, text)
+
+    # ------------------------------------------------------------------ #
+    section("9. Повторяющиеся задачи")
+    check("разбор правила", recurrence.parse("weekly:1,3") == ("weekly", (1, 3)))
+    check("канонизация порядка дней", recurrence.dump("weekly:3,1") == "weekly:1,3")
+    check("полная неделя сводится к daily", recurrence.dump("weekly:0,1,2,3,4,5,6") == "daily")
+    check("подпись нескольких дней",
+          recurrence.label("weekly:1,3") == "по вторникам и четвергам",
+          recurrence.label("weekly:1,3"))
+    check("подпись одного дня", recurrence.label("weekly:2") == "каждую среду",
+          recurrence.label("weekly:2"))
+    check("мусор в правиле — ошибка", _raises(lambda: recurrence.parse("каждый вторник")))
+
+    # Среда 16:00 по Алматы: следующий вторник — уже через границу недели.
+    wednesday = datetime(2026, 10, 14, 16, 0, tzinfo=tz).astimezone(timezone.utc)
+    next_one = recurrence.next_due(wednesday, "weekly:1,3", tz).astimezone(tz)
+    check("через границу недели: ср -> чт той же недели",
+          next_one.strftime("%a %H:%M") == "Thu 16:00", str(next_one))
+    thursday = datetime(2026, 10, 15, 16, 0, tzinfo=tz).astimezone(timezone.utc)
+    after = recurrence.next_due(thursday, "weekly:1,3", tz).astimezone(tz)
+    check("с чт следующий — вторник новой недели",
+          after.strftime("%a %H:%M") == "Tue 16:00" and after.date().day == 20, str(after))
+    check("локальное время суток сохраняется",
+          recurrence.next_due(wednesday, "daily", tz).astimezone(tz).strftime("%H:%M") == "16:00")
+
+    series = await llm.execute_tool("add_task", {
+        "title": "Тренировка",
+        "due_at_local": iso_local(now + timedelta(days=1), tz),
+        "category": "sport",
+        "priority": "normal",
+        "recurrence": "weekly:1,3",
+    })
+    check("серия создана", series.get("ok") is True, str(series))
+    series_id = series["task"]["id"]
+    check("правило сохранено канонично",
+          (await db.get_task(series_id))["recurrence"] == "weekly:1,3")
+    check("галочка повтора в строке списка",
+          "🔁" in formatting.task_line(await db.get_task(series_id), tz))
+
+    no_due = await llm.execute_tool("add_task", {
+        "title": "Серия без срока", "recurrence": "daily", "due_at_local": None,
+    })
+    check("повтор без срока отклонён",
+          no_due.get("ok") is False and "срок" in no_due.get("error", "").lower(), str(no_due))
+
+    bad_rule = await llm.execute_tool("add_task", {
+        "title": "Серия с мусором", "recurrence": "weekly:9",
+        "due_at_local": iso_local(now + timedelta(days=1), tz),
+    })
+    check("нераспознанное правило отклонено", bad_rule.get("ok") is False, str(bad_rule))
+
+    open_before = len(await db.list_tasks(status="open", limit=50))
+    closed = await db.complete_task(series_id)
+    shifted = closed["next_task"]
+    check("серия продолжилась новой задачей",
+          shifted is not None and shifted["id"] != series_id and shifted["recurrence"] == "weekly:1,3",
+          str(shifted))
+    check("следующая серия встала на будний день правила",
+          timeutil.parse_iso(shifted["due_at"]).astimezone(tz).weekday() in (1, 3),
+          str(shifted["due_at"]))
+    check("в открытых задач столько же (серия не размножилась)",
+          len(await db.list_tasks(status="open", limit=50)) == open_before, "количество изменилось")
+
+    again_closed = await db.complete_task(series_id)
+    check("повторное закрытие не плодит копии", again_closed["next_task"] is None, str(again_closed))
+
+    detached = await llm.execute_tool("update_task", {
+        "task_id": shifted["id"], "new_recurrence": "нет",
+    })
+    check("серию можно отключить",
+          detached["ok"] and (await db.get_task(shifted["id"]))["recurrence"] is None, str(detached))
+
+    # ------------------------------------------------------------------ #
+    section("10. Изображения")
+    plain_content = llm._build_user_content("привет", ())
+    check("без картинок контент остаётся строкой",
+          isinstance(plain_content, str) and plain_content == "привет", str(plain_content))
+
+    with_image = llm._build_user_content("разбери расписание", [("image/jpeg", b"\xff\xd8fake")])
+    check("с картинкой контент — список частей", isinstance(with_image, list) and len(with_image) == 2,
+          str(with_image))
+    check("текст идёт первым",
+          with_image[0]["type"] == "text" and with_image[1]["type"] == "image_url", str(with_image))
+    check("картинка в формате data URL",
+          with_image[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"),
+          str(with_image[1]))
+
+    no_text = llm._build_user_content("", [("image/jpeg", b"\xff\xd8fake")])
+    check("подпись необязательна", no_text[0]["text"], str(no_text))
+
+    oversized = b"0" * (llm.IMAGE_MAX_BYTES + 1)
+    check("слишком большое изображение — ошибка",
+          _raises(lambda: llm._build_user_content("x", [("image/jpeg", oversized)])))
+
+    # ------------------------------------------------------------------ #
+    section("11. Экспорт в календарь")
+    ics_tasks = [await db.get_task(flight["task"]["id"])]
+    ics_tasks[0]["title"] = "Дедлайн, Air Astana; документы"
+    ics_tasks[0]["details"] = "Паспорт\nмедкомиссия"
+    ics = calendar_export.build_ics(ics_tasks, tz)
+
+    check("переводы строк только CRLF", "\n" not in ics.replace("\r\n", ""), repr(ics[:80]))
+    check("файл заканчивается CRLF", ics.endswith("\r\n"))
+    check("BEGIN/END:VEVENT сбалансированы",
+          ics.count("BEGIN:VEVENT") == ics.count("END:VEVENT") == 1, str(ics.count("BEGIN:VEVENT")))
+    check("начинается с BEGIN:VCALENDAR", ics.startswith("BEGIN:VCALENDAR\r\n"))
+    check("запятая и точка с запятой экранированы",
+          "SUMMARY:Дедлайн\\, Air Astana\\; документы" in ics, ics)
+    check("перевод строки в описании экранирован", "\\n" in ics, ics)
+    check("UID привязан к задаче",
+          f"UID:task-{ics_tasks[0]['id']}@{calendar_export.UID_DOMAIN}" in ics, ics)
+    check("нет строк длиннее 75 октетов",
+          all(len(line.encode("utf-8")) <= calendar_export.LINE_LIMIT
+              for line in ics.split("\r\n")),
+          str(max(len(line.encode("utf-8")) for line in ics.split("\r\n"))))
+    check("UID стабилен между выгрузками",
+          calendar_export.build_ics(ics_tasks, tz) == ics)
+
+    dateless = [await db.get_task(someday["task"]["id"])]
+    check("задачи без срока пропускаются",
+          "BEGIN:VEVENT" not in calendar_export.build_ics(dateless, tz))
+    check("пустой список даёт пустой календарь",
+          "BEGIN:VCALENDAR" in calendar_export.build_ics([], tz))
+
+    # ------------------------------------------------------------------ #
+    section("12. Конфигурация и вечерний чек-ин")
+    check("вечерний чек-ин включён по умолчанию", settings.evening == (21, 30), str(settings.evening))
+
+    os.environ["EVENING_CHECKIN_TIME"] = ""
+    get_settings.cache_clear()
+    check("пустое значение выключает чек-ин", get_settings().evening is None)
+    os.environ["EVENING_CHECKIN_TIME"] = "22:15"
+    get_settings.cache_clear()
+    check("время чек-ина читается из окружения", get_settings().evening == (22, 15))
+    del os.environ["EVENING_CHECKIN_TIME"]
+    get_settings.cache_clear()
+    check("без переменной снова 21:30", get_settings().evening == (21, 30))
+
+    check("сообщение чек-ина в общем стиле",
+          formatting.DIVIDER in formatting.evening_checkin(dateless, [], tz)
+          and f"{formatting.BULLET}Осталось" in formatting.evening_checkin(dateless, [], tz))
+    plain_checkin = formatting.evening_checkin(dateless, [], tz, plain=True)
+    check("в историю чек-ин уходит без HTML",
+          "<b>" not in plain_checkin and "<i>" not in plain_checkin, plain_checkin)
+    check("в историю попадает тот же вопрос",
+          "Итог дня" in plain_checkin and "Что успел сегодня?" in plain_checkin, plain_checkin)
+
+    # ------------------------------------------------------------------ #
+    #  Последней: init_db меняет глобальный _DB_PATH, после неё возвращаем его.
+    section("13. Миграция старой базы")
+    legacy_path = Path(tempfile.mkdtemp(prefix="assistant-legacy-")) / "old.db"
+    with sqlite3.connect(legacy_path) as connection:
+        connection.executescript(LEGACY_SCHEMA)
+        connection.execute(
+            "INSERT INTO tasks (title, due_at, category, priority, status, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Старая задача", now.isoformat(), "study", "high", "open", "chat", now.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO history (role, content, created_at) VALUES (?, ?, ?)",
+            ("user", "старое сообщение", now.isoformat()),
+        )
+
+    await db.init_db(str(legacy_path), tz=tz, default_offsets=settings.default_offsets)
+
+    with sqlite3.connect(legacy_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        indexes = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )}
+        rows = connection.execute("SELECT title, category, priority FROM tasks").fetchall()
+        history_rows = connection.execute("SELECT content FROM history").fetchall()
+
+    check(f"версия схемы поднялась до {db.SCHEMA_VERSION}", version == db.SCHEMA_VERSION, str(version))
+    check("колонка recurrence появилась", "recurrence" in columns, str(columns))
+    check("таблица progress создана", "progress" in tables, str(tables))
+    check("индекс по сериям создан", "idx_tasks_recurrence" in indexes, str(indexes))
+    check("данные задач целы",
+          rows == [("Старая задача", "study", "high")], str(rows))
+    check("история диалога цела",
+          history_rows == [("старое сообщение",)], str(history_rows))
+
+    # Повторный запуск — обычная ситуация после оборванного деплоя.
+    await db.init_db(str(legacy_path), tz=tz, default_offsets=settings.default_offsets)
+    with sqlite3.connect(legacy_path) as connection:
+        check("повторная миграция идемпотентна",
+              connection.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION)
+
+    # Возвращаем рабочую базу: дальше тесты её больше не трогают, но глобальная
+    # переменная не должна остаться указывать на временный файл.
+    await db.init_db(str(_TMP_DB), tz=tz, default_offsets=settings.default_offsets)
 
     # ------------------------------------------------------------------ #
     print("\n" + "=" * 46)

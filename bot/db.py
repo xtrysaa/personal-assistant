@@ -5,29 +5,73 @@
 записями при одновременной работе бота и планировщика.
 
 Схема:
-    tasks      — все дела/дедлайны
+    tasks      — все дела/дедлайны (в т.ч. серии повторяющихся)
     reminders  — запланированные напоминания (одна строка = одно напоминание)
+    progress   — баллы пробников и часы подготовки
     history    — последние сообщения диалога, чтобы у ИИ был контекст
+
+Схема описана дважды, и это осознанно: ``SCHEMA`` — актуальное состояние
+(его получает свежая база одним скриптом), ``MIGRATIONS`` — шаги, которыми
+старая база догоняет актуальное. ``CREATE TABLE IF NOT EXISTS`` умеет добавлять
+таблицы, но не умеет добавлять колонку в существующую таблицу — ровно поэтому
+миграции и нужны.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Sequence
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from . import timeutil
+from . import progress, recurrence, timeutil
+
+logger = logging.getLogger(__name__)
 
 _DB_PATH = "./data/assistant.db"
 
+# Часовой пояс и набор напоминаний нужны слою данных ровно для одной операции:
+# когда закрывается повторяющаяся задача, следующая серия должна встать на тот
+# же ЛОКАЛЬНЫЙ час. Устанавливаются в init_db (см. run.py).
+_TZ: ZoneInfo = ZoneInfo("Asia/Almaty")
+_DEFAULT_OFFSETS: tuple[int, ...] = (10080, 1440, 60)
+
 # Поля, которые разрешено менять через update_task (защита от SQL-инъекции
 # через имя колонки — значение всегда идёт параметром).
-_UPDATABLE_FIELDS = frozenset({"title", "details", "category", "priority"})
+_UPDATABLE_FIELDS = frozenset({"title", "details", "category", "priority", "recurrence"})
 
-SCHEMA = """
+# Поля, для которых явный None означает «очистить», а не «аргумент не передан».
+# У остальных текстовых полей None = «не менять» (см. update_task).
+_NULLABLE_FIELDS = frozenset({"recurrence"})
+
+# Актуальная версия схемы. Свежая база получает её сразу, старая проходит
+# MIGRATIONS шаг за шагом.
+SCHEMA_VERSION = 3
+
+_PROGRESS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS progress (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,                          -- score | hours
+    subject     TEXT NOT NULL,                          -- sat | ielts | ent | math | ...
+    value       REAL NOT NULL,                          -- балл или часы
+    scale       REAL,                                   -- максимум шкалы балла; для часов NULL
+    note        TEXT,
+    occurred_on TEXT NOT NULL,                          -- ЛОКАЛЬНАЯ дата YYYY-MM-DD (см. add_progress)
+    created_at  TEXT NOT NULL
+)
+""".strip()
+
+_PROGRESS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_progress_kind_subject
+    ON progress (kind, subject, occurred_on)
+""".strip()
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS tasks (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     title        TEXT    NOT NULL,
@@ -36,6 +80,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     category     TEXT    NOT NULL DEFAULT 'other',
     priority     TEXT    NOT NULL DEFAULT 'normal',
     status       TEXT    NOT NULL DEFAULT 'open',       -- open | completed
+    recurrence   TEXT,                                  -- NULL = разовая; см. bot/recurrence.py
     source       TEXT    NOT NULL DEFAULT 'chat',
     created_at   TEXT    NOT NULL,
     completed_at TEXT
@@ -52,6 +97,10 @@ CREATE TABLE IF NOT EXISTS reminders (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reminders_task_offset
     ON reminders (task_id, offset_minutes);
 
+{_PROGRESS_TABLE_SQL};
+
+{_PROGRESS_INDEX_SQL};
+
 CREATE TABLE IF NOT EXISTS history (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     role       TEXT NOT NULL,                           -- user | assistant
@@ -60,8 +109,29 @@ CREATE TABLE IF NOT EXISTS history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status_due   ON tasks (status, due_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_recurrence   ON tasks (recurrence, due_at);
 CREATE INDEX IF NOT EXISTS idx_reminders_pending  ON reminders (sent_at, fire_at);
 """
+
+# Шаги миграции: (версия, запросы). Каждый выполняется один раз и отмечается
+# в PRAGMA user_version. Все запросы идемпотентны — повторный запуск после
+# оборванного деплоя не должен ломать старт бота.
+MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    # 1 — серии повторяющихся задач (см. bot/recurrence.py). Единственный шаг,
+    #     который SCHEMA выполнить не может: колонку в существующую таблицу
+    #     добавить через CREATE TABLE IF NOT EXISTS нельзя.
+    (1, ("ALTER TABLE tasks ADD COLUMN recurrence TEXT",)),
+    # 2 — дашборд подготовки (см. bot/progress.py).
+    (2, (_PROGRESS_TABLE_SQL, _PROGRESS_INDEX_SQL)),
+    # 3 — индекс под выборку серий в напоминаниях и списках.
+    (3, ("CREATE INDEX IF NOT EXISTS idx_tasks_recurrence ON tasks (recurrence, due_at)",)),
+)
+
+# «ALTER TABLE ... ADD COLUMN» в SQLite не поддерживает IF NOT EXISTS —
+# наличие колонки приходится проверять вручную (см. _apply_migration).
+_ADD_COLUMN = re.compile(
+    r"ALTER\s+TABLE\s+(?P<table>\w+)\s+ADD\s+COLUMN\s+(?P<column>\w+)", re.IGNORECASE
+)
 
 
 @asynccontextmanager
@@ -73,17 +143,114 @@ async def _connect() -> AsyncIterator[aiosqlite.Connection]:
         yield connection
 
 
-async def init_db(path: str) -> None:
-    """Создать папку, применить схему и включить WAL. Вызывается один раз при старте."""
-    global _DB_PATH
+async def init_db(
+    path: str,
+    *,
+    tz: ZoneInfo | None = None,
+    default_offsets: Sequence[int] | None = None,
+) -> None:
+    """Создать папку, привести схему к актуальной версии и включить WAL.
+
+    Вызывается один раз при старте. И свежая база, и та, что уже месяц работает
+    на сервере, приходят здесь к одному состоянию схемы.
+    """
+    global _DB_PATH, _TZ, _DEFAULT_OFFSETS
     _DB_PATH = path
+    if tz is not None:
+        _TZ = tz
+    if default_offsets:
+        _DEFAULT_OFFSETS = tuple(default_offsets)
 
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
 
     async with aiosqlite.connect(path) as connection:
-        await connection.executescript("PRAGMA journal_mode = WAL;\n" + SCHEMA)
+        connection.row_factory = aiosqlite.Row
+
+        # Признак старой базы надо снять ДО применения SCHEMA: после него
+        # таблица tasks существует в любом случае, и отличить новую базу
+        # от работающей уже не получится.
+        legacy = await _table_exists(connection, "tasks")
+
+        # WAL включаем отдельным запросом: внутри executescript он не сохраняется.
+        await connection.execute("PRAGMA journal_mode = WAL")
+
+        if legacy:
+            # Миграции идут ДО SCHEMA, и порядок здесь принципиален. SCHEMA
+            # описывает актуальное состояние и создаёт индекс по колонке
+            # recurrence. На старой базе такой колонки ещё нет, поэтому
+            # «сначала SCHEMA, потом миграции» падает с no such column:
+            # recurrence — причём падает ДО того, как миграция её добавит.
+            await _migrate(connection)
+
+        await connection.executescript(SCHEMA)
+
+        if not legacy:
+            # Свежая база получила всё из SCHEMA — миграции ей не нужны,
+            # достаточно зафиксировать актуальную версию. Делаем это после
+            # executescript: если он упадёт, версия не соврёт о состоянии схемы.
+            await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
         await connection.commit()
+
+    logger.info("База готова: %s (user_version = %d)", path, SCHEMA_VERSION)
+
+
+async def _table_exists(connection: aiosqlite.Connection, table: str) -> bool:
+    """Есть ли такая таблица в базе."""
+    cursor = await connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    )
+    return await cursor.fetchone() is not None
+
+
+async def _has_column(connection: aiosqlite.Connection, table: str, column: str) -> bool:
+    """Есть ли такая колонка в таблице (PRAGMA table_info)."""
+    cursor = await connection.execute(f"PRAGMA table_info({table})")  # noqa: S608 — имя из шаблона миграции
+    return any(row["name"] == column for row in await cursor.fetchall())
+
+
+async def _apply_migration(connection: aiosqlite.Connection, statement: str) -> None:
+    """Выполнить один запрос миграции.
+
+    `ALTER TABLE ... ADD COLUMN` в SQLite не поддерживает IF NOT EXISTS, поэтому
+    наличие колонки проверяем сами. Без этой проверки повторный запуск после
+    обрыва между ALTER и записью user_version упал бы с «duplicate column name»,
+    и бот не поднялся бы вообще — ровно там, где база цела.
+    """
+    match = _ADD_COLUMN.search(statement)
+    if match and await _has_column(connection, match["table"], match["column"]):
+        logger.info(
+            "Шаг миграции пропущен: колонка %s.%s уже есть", match["table"], match["column"]
+        )
+        return
+    await connection.execute(statement)
+
+
+async def _migrate(connection: aiosqlite.Connection) -> None:
+    """Догнать схему уже работающей базы до SCHEMA_VERSION.
+
+    База, созданная до появления миграций, находится на user_version = 0 — и
+    миграция №1 обязана выполниться: именно она добавляет колонку recurrence,
+    которую новый код уже читает. Поэтому здесь НЕЛЬЗЯ «считать» дофичевую базу
+    версией 1: шаг `if version <= current` просто пропустил бы её.
+    """
+    cursor = await connection.execute("PRAGMA user_version")
+    row = await cursor.fetchone()
+    current = int(row[0])
+
+    for version, statements in MIGRATIONS:
+        if version <= current:
+            continue
+        for statement in statements:
+            await _apply_migration(connection, statement)
+        # Подстановка версии в PRAGMA, а не параметр: SQLite не принимает
+        # placeholder в user_version. Значение — целая константа из кода.
+        await connection.execute(f"PRAGMA user_version = {version}")
+        logger.info("Схема обновлена до версии %d", version)
+
+    if current < SCHEMA_VERSION:
+        logger.info("Миграции завершены: было %d, стало %d", current, SCHEMA_VERSION)
 
 
 # --------------------------------------------------------------------------- #
@@ -99,9 +266,22 @@ def _row_to_task(row: aiosqlite.Row) -> dict[str, Any]:
         "category": row["category"],
         "priority": row["priority"],
         "status": row["status"],
+        "recurrence": row["recurrence"],
+        "source": row["source"],
         "created_at": row["created_at"],
         "completed_at": row["completed_at"],
     }
+
+
+def _normalize_recurrence(rule: Any) -> str | None:
+    """Привести правило повторения к каноническому виду.
+
+    None и пустая строка означают «задача разовая». Мусор не пропускаем:
+    разбор правила — единственный источник правды в bot/recurrence.py.
+    """
+    if rule is None or not str(rule).strip():
+        return None
+    return recurrence.dump(str(rule))
 
 
 async def _sync_reminders(
@@ -143,15 +323,28 @@ async def create_task(
     details: str | None = None,
     offsets: Sequence[int] = (),
     source: str = "chat",
+    recurrence: str | None = None,
 ) -> dict[str, Any]:
-    """Создать задачу и напоминания к ней. Возвращает задачу с напоминаниями."""
+    """Создать задачу и напоминания к ней. Возвращает задачу с напоминаниями.
+
+    `recurrence` — правило повторения в формате bot/recurrence.py ('daily'
+    или 'weekly:1,3'). Требует срока: серию не от чего отсчитывать.
+    """
+    rule = _normalize_recurrence(recurrence)
+    if rule and due_at is None:
+        raise ValueError(
+            "Повторяющаяся задача должна иметь срок — иначе непонятно, от какой даты "
+            "считать следующий раз."
+        )
+
     due_iso = due_at.astimezone(timezone.utc).isoformat() if due_at else None
 
     async with _connect() as connection:
         cursor = await connection.execute(
             """
-            INSERT INTO tasks (title, details, due_at, category, priority, status, source, created_at)
-            VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+            INSERT INTO tasks
+                (title, details, due_at, category, priority, status, recurrence, source, created_at)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
             """,
             (
                 title.strip(),
@@ -159,6 +352,7 @@ async def create_task(
                 due_iso,
                 category,
                 priority,
+                rule,
                 source,
                 timeutil.now_utc().isoformat(),
             ),
@@ -198,6 +392,7 @@ async def list_tasks(
     status: str = "open",
     start: datetime | None = None,
     end: datetime | None = None,
+    completed_between: tuple[datetime, datetime] | None = None,
     category: str | None = None,
     query: str | None = None,
     limit: int = 50,
@@ -206,6 +401,10 @@ async def list_tasks(
 
     status : "open" | "completed" | "any"
     start/end : границы по сроку в UTC (задачи без срока при этом не попадают)
+    completed_between : границы по МОМЕНТУ закрытия, а не по сроку. Нужны там,
+        где вопрос звучит как «что сделано сегодня/за неделю»: задача, закрытая
+        сегодня, могла иметь срок на следующий месяц, и фильтр по сроку её
+        бы потерял.
     """
     sql = ["SELECT * FROM tasks WHERE 1 = 1"]
     params: list[Any] = []
@@ -220,6 +419,14 @@ async def list_tasks(
     if end is not None:
         sql.append("AND due_at IS NOT NULL AND due_at < ?")
         params.append(end.astimezone(timezone.utc).isoformat())
+
+    if completed_between is not None:
+        done_start, done_end = completed_between
+        sql.append("AND completed_at IS NOT NULL AND completed_at >= ? AND completed_at < ?")
+        params.extend([
+            done_start.astimezone(timezone.utc).isoformat(),
+            done_end.astimezone(timezone.utc).isoformat(),
+        ])
 
     if category:
         sql.append("AND category = ?")
@@ -251,14 +458,22 @@ async def update_task(
 
     `changes` — только текстовые/служебные поля. Смена статуса на completed
     автоматически закрывает задачу и снимает неотправленные напоминания.
+
+    Для `recurrence` явный None — это «сделать задачу разовой», а не «не менять»
+    (см. _NULLABLE_FIELDS).
     """
     assignments: list[str] = []
     params: list[Any] = []
 
     for field, value in changes.items():
-        if field in _UPDATABLE_FIELDS and value is not None:
-            assignments.append(f"{field} = ?")
-            params.append(value)
+        if field not in _UPDATABLE_FIELDS:
+            continue
+        if value is None and field not in _NULLABLE_FIELDS:
+            continue  # None у текстового поля = «аргумент не передан»
+        if field == "recurrence":
+            value = _normalize_recurrence(value)
+        assignments.append(f"{field} = ?")
+        params.append(value)
 
     if touch_due:
         assignments.append("due_at = ?")
@@ -297,14 +512,88 @@ async def update_task(
             due_iso = row["due_at"] if row else None
             await _sync_reminders(connection, task_id, due_iso, offsets or ())
 
+        # Повтор без срока бессмыслен: непонятно, от какой даты считать серию.
+        # Проверяем итоговое состояние строки ДО commit: исключение закроет
+        # соединение без фиксации, и SQLite откатит правки целиком.
+        cursor = await connection.execute(
+            "SELECT due_at, recurrence FROM tasks WHERE id = ?", (task_id,)
+        )
+        row = await cursor.fetchone()
+        if row is not None and row["recurrence"] and not row["due_at"]:
+            raise ValueError(
+                "Повторяющаяся задача должна иметь срок: сначала назначь дату через update_task."
+            )
+
         await connection.commit()
 
     return await get_task(task_id)
 
 
 async def complete_task(task_id: int) -> dict[str, Any] | None:
-    """Отметить задачу выполненной."""
-    return await update_task(task_id, {"status": "completed"})
+    """Отметить задачу выполненной. Для серии — создать следующую.
+
+    Ссылка на следующую задачу серии возвращается в ключе ``next_task``
+    (None, если задача разовая или уже была закрыта).
+
+    Почему новая задача, а не переиспользование id: на id висят напоминания
+    (уникальный индекс по task_id + offset_minutes), completed_at и ссылки
+    в истории — переиспользование сломало бы всё разом.
+    """
+    before = await get_task(task_id)
+    if before is None:
+        return None
+
+    if before["status"] != "open":
+        # Уже закрыта. Без этой проверки двойной тап по кнопке «выполнено»
+        # породил бы две копии серии.
+        before["next_task"] = None
+        return before
+
+    task = await update_task(task_id, {"status": "completed"})
+    if task is None:
+        return None
+
+    task["next_task"] = await _roll_recurrence(before)
+    return task
+
+
+async def _roll_recurrence(before: dict[str, Any]) -> dict[str, Any] | None:
+    """Создать следующую задачу серии по правилу повторения закрытой задачи.
+
+    `before` — снимок задачи ДО закрытия: у закрытой уже удалены неотправленные
+    напоминания, а набор смещений нужно перенести в новую серию.
+    """
+    rule = before.get("recurrence")
+    if not rule or not before.get("due_at"):
+        return None
+
+    try:
+        next_due = recurrence.next_due(timeutil.parse_iso(before["due_at"]), rule, _TZ)
+    except ValueError:
+        logger.warning("Не удалось перенести серию задачи #%s: правило %r", before["id"], rule)
+        return None
+
+    # Смещения напоминаний переносим с исходной задачи. Если строк не осталось
+    # (например, все сроки срабатывания оказались в прошлом при создании),
+    # берём набор по умолчанию — иначе серия осталась бы совсем без напоминаний.
+    offsets = [int(item["offset_minutes"]) for item in (before.get("reminders") or [])]
+    if not offsets:
+        offsets = list(_DEFAULT_OFFSETS)
+
+    try:
+        return await create_task(
+            title=before["title"],
+            due_at=next_due,
+            category=before["category"],
+            priority=before["priority"],
+            details=before.get("details"),
+            offsets=offsets,
+            source=before.get("source") or "chat",
+            recurrence=rule,
+        )
+    except ValueError:
+        logger.exception("Не удалось создать следующую задачу серии #%s", before["id"])
+        return None
 
 
 async def delete_task(task_id: int) -> bool:
@@ -374,6 +663,103 @@ async def mark_reminders(reminder_ids: Sequence[int], *, sent: bool = True) -> N
             [value, *reminder_ids],
         )
         await connection.commit()
+
+
+# --------------------------------------------------------------------------- #
+#  Прогресс подготовки (баллы пробников и часы занятий)
+# --------------------------------------------------------------------------- #
+
+async def add_progress(
+    *,
+    kind: str,
+    subject: str,
+    value: float,
+    scale: float | None = None,
+    note: str | None = None,
+    occurred_on: str | None = None,
+) -> dict[str, Any]:
+    """Записать балл пробника или часы подготовки.
+
+    `occurred_on` — ЛОКАЛЬНАЯ дата пользователя (YYYY-MM-DD), и это единственное
+    место в проекте, где нарушено правило «в базе всё в UTC». Причина: аналитика
+    привязана к дню пользователя. Вечерний чек-ин в 23:30 по Алматы — это ещё
+    сегодняшний день, а по UTC уже завтрашний, и запись уехала бы не в тот день.
+    """
+    if kind not in progress.KINDS:
+        raise ValueError(f"Неизвестный вид записи: {kind!r}. Ожидается score или hours.")
+
+    if occurred_on and str(occurred_on).strip():
+        try:
+            occurred_on = date.fromisoformat(str(occurred_on).strip()).isoformat()
+        except ValueError as exc:
+            raise ValueError(
+                f"Не удалось разобрать дату {occurred_on!r} (нужен формат YYYY-MM-DD)."
+            ) from exc
+    else:
+        occurred_on = datetime.now(_TZ).date().isoformat()
+
+    created_at = timeutil.now_utc().isoformat()
+    async with _connect() as connection:
+        cursor = await connection.execute(
+            """
+            INSERT INTO progress (kind, subject, value, scale, note, occurred_on, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (kind, subject, float(value), scale, note, occurred_on, created_at),
+        )
+        await connection.commit()
+        entry_id = int(cursor.lastrowid or 0)
+
+    return {
+        "id": entry_id,
+        "kind": kind,
+        "subject": subject,
+        "value": float(value),
+        "scale": scale,
+        "note": note,
+        "occurred_on": occurred_on,
+        "created_at": created_at,
+    }
+
+
+async def list_progress(
+    *,
+    kind: str | None = None,
+    subject: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Записи прогресса, свежие сверху.
+
+    Окна по датам здесь намеренно нет: баллы и часы считаются по разным
+    периодам (часы — за последнюю неделю, балл сравнивается с предыдущим
+    пробником хоть за прошлый месяц). Фильтровать по дате в запросе значило бы
+    выкинуть предыдущий результат и вместе с ним всю динамику — поэтому окно
+    применяет progress.summarize, и делает это осознанно.
+    """
+    sql = ["SELECT * FROM progress WHERE 1 = 1"]
+    params: list[Any] = []
+
+    if kind:
+        sql.append("AND kind = ?")
+        params.append(kind)
+    if subject:
+        sql.append("AND subject = ?")
+        params.append(subject)
+
+    sql.append("ORDER BY occurred_on DESC, id DESC LIMIT ?")
+    params.append(limit)
+
+    async with _connect() as connection:
+        cursor = await connection.execute(" ".join(sql), params)
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def delete_progress(entry_id: int) -> bool:
+    """Удалить запись прогресса (ошибочный балл или часы)."""
+    async with _connect() as connection:
+        cursor = await connection.execute("DELETE FROM progress WHERE id = ?", (entry_id,))
+        await connection.commit()
+        return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------- #

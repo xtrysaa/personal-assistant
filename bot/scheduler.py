@@ -61,6 +61,16 @@ class AssistantScheduler:
                 coalesce=True,
             )
 
+        if self.settings.evening:
+            hour, minute = self.settings.evening
+            self.scheduler.add_job(
+                self._evening_checkin,
+                CronTrigger(hour=hour, minute=minute, timezone=self.settings.tz),
+                id="evening",
+                max_instances=1,
+                coalesce=True,
+            )
+
         if self.settings.weekly_day and self.settings.weekly_time:
             hour, minute = self.settings.weekly_time
             self.scheduler.add_job(
@@ -128,8 +138,11 @@ class AssistantScheduler:
                 f"{local_now.day} {timeutil.MONTHS_SHORT[local_now.month - 1]}, "
                 f"{timeutil.WEEKDAYS_SHORT[local_now.weekday()]}"
             )
-            blocks = [f"☀️ <b>Доброе утро!</b> {date_label}"]
-            blocks.append(self._block("Сегодня", today, empty="На сегодня дел нет — можно спокойно готовиться."))
+            blocks = [
+                f"☀️ <b>Доброе утро, Альнур</b> · {date_label}",
+                formatting.DIVIDER,
+                self._block("Сегодня", today, empty="На сегодня дел нет — можно спокойно готовиться."),
+            ]
 
             if overdue:
                 blocks.append(self._block("⚠️ Просрочено", overdue))
@@ -143,6 +156,34 @@ class AssistantScheduler:
         except Exception:  # noqa: BLE001
             logger.exception("Ошибка утреннего дайджеста")
 
+    async def _evening_checkin(self) -> None:
+        """Вечерний вопрос: итог дня и приглашение записать часы подготовки.
+
+        Машины состояний здесь нет намеренно: вопрос дополнительно кладётся в
+        историю диалога как обычная реплика ассистента, поэтому когда Альнур
+        ответит, модель уже видит контекст и сама вызывает `log_hours`.
+
+        В историю идёт текст БЕЗ HTML: разметку модель начинает копировать в
+        свои ответы, и пользователь видит теги.
+        """
+        try:
+            tz = self.settings.tz
+            now = timeutil.now_utc()
+            start_today, end_today = timeutil.day_bounds(tz)
+
+            done = await db.list_tasks(
+                status="completed", completed_between=(start_today, now), limit=30
+            )
+            # Всё, что должно было быть закрыто к этому моменту: и сегодняшнее,
+            # и подвисшее с прошлых дней — вечером важно видеть и то, и другое.
+            left = await db.list_tasks(status="open", end=end_today, limit=30)
+
+            text = formatting.evening_checkin(done, left, tz)
+            if await self._send(text):
+                await db.add_message("assistant", formatting.evening_checkin(done, left, tz, plain=True))
+        except Exception:  # noqa: BLE001 — задание не должно умирать молча
+            logger.exception("Ошибка вечернего чек-ина")
+
     async def _weekly_review(self) -> None:
         """Недельный обзор в воскресенье: что сделано, что впереди, где перегруз."""
         try:
@@ -154,19 +195,22 @@ class AssistantScheduler:
                 status="open", start=now, end=timeutil.in_days(tz, 7), limit=60
             )
             no_deadline = await db.list_tasks(status="open", limit=60)
+            # Считаем по моменту закрытия, а не по сроку: задача, закрытая в
+            # эту неделю, могла иметь срок на следующий месяц, и фильтр по
+            # сроку потерял бы её.
             done = await db.list_tasks(
-                status="completed", start=week_start, end=now, limit=60
+                status="completed", completed_between=(week_start, now), limit=60
             )
 
             by_category: dict[str, int] = {}
             for task in upcoming:
                 by_category[task["category"]] = by_category.get(task["category"], 0) + 1
 
-            blocks = ["📊 <b>Итоги недели</b>"]
+            blocks = ["📊 <b>Итоги недели</b>", formatting.DIVIDER]
             if done:
-                blocks.append(f"✅ Закрыто задач: <b>{len(done)}</b>")
+                blocks.append(f"{formatting.BULLET}Закрыто задач: <b>{len(done)}</b>")
             else:
-                blocks.append("✅ Закрытых задач за неделю нет.")
+                blocks.append(f"{formatting.BULLET}Закрытых задач за неделю нет.")
 
             blocks.append(self._block("На следующей неделе", upcoming, empty="Пусто."))
 
@@ -175,12 +219,12 @@ class AssistantScheduler:
                     f"{formatting.category_emoji(cat)} {cat}: {count}"
                     for cat, count in sorted(by_category.items(), key=lambda item: -item[1])
                 )
-                blocks.append(f"🧭 <b>Куда уходит время:</b> {summary}")
+                blocks.append(f"{formatting.BULLET}<b>Куда уходит время:</b> {summary}")
 
             without_due = [task for task in no_deadline if not task["due_at"]]
             if without_due:
                 blocks.append(
-                    f"🗂 <b>Без срока: {len(without_due)}</b> — "
+                    f"{formatting.BULLET}<b>Без срока: {len(without_due)}</b> — "
                     f"{', '.join('#%d %s' % (task['id'], task['title']) for task in without_due[:5])}"
                     "\nСтоит назначить даты или удалить лишнее."
                 )

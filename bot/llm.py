@@ -1,7 +1,7 @@
 """Слой LLM: разговор с моделью + function calling (tool use).
 
 Логика такая:
-1. Пользователь пишет свободным текстом.
+1. Пользователь пишет свободным текстом (или присылает фото/голосовое).
 2. Модель либо просто отвечает, либо просит вызвать инструмент (add_task и т.д.).
 3. Мы выполняем инструмент локально (SQLite), возвращаем результат модели.
 4. Модель формулирует финальный ответ — уже зная, что реально попало в базу.
@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from datetime import datetime, time, timedelta
@@ -18,7 +19,7 @@ from typing import Any, Sequence
 
 from openai import AsyncOpenAI
 
-from . import db, formatting, timeutil
+from . import db, formatting, progress, recurrence, timeutil
 from .config import Settings, get_settings
 from .prompts import build_system_prompt
 
@@ -34,6 +35,10 @@ MAX_STEPS = 6
 
 # Старые напоминания (просроченные сильнее этого окна) не отправляем.
 REMINDER_GRACE = timedelta(hours=6)
+
+# Предел размера картинки до base64-кодирования. Base64 добавляет ещё треть,
+# а провайдер платит за это токенами: снимок экрана на 3 МБ уже велик.
+IMAGE_MAX_BYTES = 3 * 1024 * 1024
 
 
 def get_client() -> AsyncOpenAI:
@@ -94,6 +99,14 @@ TOOLS: list[dict[str, Any]] = [
                             "Не указывай, если пользователь не просил особый режим."
                         ),
                     },
+                    "recurrence": {
+                        "type": "string",
+                        "description": (
+                            "Правило повторения для регулярных дел: 'daily' — каждый день, "
+                            "'weekly:1,3' — по вторникам и четвергам (0 = понедельник, 6 = воскресенье). "
+                            "Передавай ТОЛЬКО вместе с due_at_local. Для разовых дел не указывай."
+                        ),
+                    },
                 },
                 "required": ["title", "category", "priority"],
             },
@@ -145,6 +158,14 @@ TOOLS: list[dict[str, Any]] = [
                     "new_priority": {"type": "string", "enum": list(formatting.PRIORITIES)},
                     "new_details": {"type": "string"},
                     "remind_offsets_minutes": {"type": "array", "items": {"type": "integer"}},
+                    "new_recurrence": {
+                        "type": "string",
+                        "description": (
+                            "Новое правило повторения: 'daily', 'weekly:1,3' "
+                            "или 'none', чтобы снова сделать дело разовым. "
+                            "У задачи обязательно должен остаться срок."
+                        ),
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -181,6 +202,84 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_score",
+            "description": (
+                "Записать результат пробного теста или экзамена (SAT, IELTS, ЕНТ, школьные). "
+                "Это НЕ задача: так копится статистика подготовки и видна динамика."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "enum": list(progress.SUBJECTS),
+                        "description": "Предмет или экзамен.",
+                    },
+                    "value": {"type": "number", "description": "Набранный балл."},
+                    "scale": {
+                        "type": "number",
+                        "description": (
+                            "Максимум шкалы: SAT 1600, IELTS 9, ЕНТ 140. "
+                            "Если пользователь не назвал — не передавай, подставим известный максимум."
+                        ),
+                    },
+                    "occurred_on_local": {
+                        "type": "string",
+                        "description": "Дата теста YYYY-MM-DD, если это был не сегодняшний день.",
+                    },
+                    "note": {"type": "string", "description": "Заметка: что далось тяжело, где просел."},
+                },
+                "required": ["subject", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_hours",
+            "description": (
+                "Записать время, потраченное на подготовку. Это НЕ задача: "
+                "так видно, сколько часов реально уходит на каждый предмет."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "enum": list(progress.SUBJECTS)},
+                    "hours": {"type": "number", "description": "Количество часов (например 1.5)."},
+                    "occurred_on_local": {
+                        "type": "string",
+                        "description": "Дата занятия YYYY-MM-DD, если это был не сегодняшний день.",
+                    },
+                    "note": {"type": "string", "description": "Что именно делал."},
+                },
+                "required": ["subject", "hours"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_progress",
+            "description": (
+                "Показать статистику подготовки: последние баллы пробников с динамикой "
+                "и потраченные часы. Используй, если спрашивают про прогресс, "
+                "«как у меня с SAT», «сколько я занимался»."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "enum": list(progress.SUBJECTS)},
+                    "days": {
+                        "type": "integer",
+                        "description": "За сколько последних дней считать часы. По умолчанию 7.",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -188,11 +287,19 @@ TOOLS: list[dict[str, Any]] = [
 #  Основной цикл
 # --------------------------------------------------------------------------- #
 
-async def run_agent(user_text: str, hint: str | None = None) -> str:
+async def run_agent(
+    user_text: str,
+    hint: str | None = None,
+    images: Sequence[tuple[str, bytes]] = (),
+) -> str:
     """Обработать сообщение пользователя и вернуть ответ ассистента.
 
     `hint` — служебная подсказка модели (например, для команды /add:
     «пользователь явно просит создать задачу»). В историю она не попадает.
+
+    `images` — пары (mime, байты) приложенных картинок. В историю диалога
+    уходит ТОЛЬКО текст: base64 в базе раздувал бы её без предела, а контекст
+    от этого не выигрывает — расписание имеет смысл один раз, при разборе.
     """
     settings = get_settings()
     history = await db.get_history(limit=HISTORY_LIMIT)
@@ -203,7 +310,7 @@ async def run_agent(user_text: str, hint: str | None = None) -> str:
     messages.extend(history)
 
     content = user_text if not hint else f"{user_text}\n\n[служебная подсказка: {hint}]"
-    messages.append({"role": "user", "content": content})
+    messages.append({"role": "user", "content": _build_user_content(content, images)})
 
     await db.add_message("user", user_text)
 
@@ -242,6 +349,36 @@ async def run_agent(user_text: str, hint: str | None = None) -> str:
     return fallback
 
 
+def _build_user_content(
+    text: str, images: Sequence[tuple[str, bytes]]
+) -> str | list[dict[str, Any]]:
+    """Собрать `content` для запроса к модели.
+
+    Без картинок возвращаем обычную строку: так запрос остаётся ровно таким,
+    каким был до появления фото, и текстовый/голосовой пути не меняются.
+    С картинками — список частей в формате OpenAI vision, который OpenRouter
+    принимает как есть:
+
+        [{"type": "text", "text": ...},
+         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}]
+    """
+    if not images:
+        return text
+
+    parts: list[dict[str, Any]] = [
+        {"type": "text", "text": text or "Разбери, что на изображении."}
+    ]
+    for mime, payload in images:
+        if len(payload) > IMAGE_MAX_BYTES:
+            raise ValueError(
+                f"Изображение больше {IMAGE_MAX_BYTES // (1024 * 1024)} МБ — "
+                "отправь снимок меньшего размера."
+            )
+        encoded = base64.b64encode(payload).decode("ascii")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+    return parts
+
+
 def _load_arguments(raw: str | None) -> dict[str, Any]:
     """Разобрать JSON-аргументы инструмента; пустая строка = пустой объект."""
     if not raw:
@@ -267,6 +404,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         "update_task": _tool_update_task,
         "complete_task": _tool_complete_task,
         "delete_task": _tool_delete_task,
+        "log_score": _tool_log_score,
+        "log_hours": _tool_log_hours,
+        "get_progress": _tool_get_progress,
     }
 
     handler = handlers.get(name)
@@ -303,6 +443,7 @@ async def _tool_add_task(args: dict[str, Any], settings: Settings) -> dict[str, 
         details=(str(args["details"]).strip() if args.get("details") else None),
         offsets=offsets,
         source="chat",
+        recurrence=_recurrence_arg(args.get("recurrence")),
     )
     return {"ok": True, "task": _dump(task, settings)}
 
@@ -349,6 +490,8 @@ async def _tool_update_task(args: dict[str, Any], settings: Settings) -> dict[st
         changes["category"] = args["new_category"]
     if args.get("new_priority") in formatting.PRIORITIES:
         changes["priority"] = args["new_priority"]
+    if args.get("new_recurrence") is not None:
+        changes["recurrence"] = _recurrence_arg(args["new_recurrence"])  # None = сделать разовой
 
     touch_due = bool(args.get("new_due_at_local"))
     due_at = _parse_due(args["new_due_at_local"], settings, allow_past=True) if touch_due else None
@@ -390,12 +533,133 @@ async def _tool_delete_task(args: dict[str, Any], settings: Settings) -> dict[st
 
 
 # --------------------------------------------------------------------------- #
+#  Инструменты прогресса подготовки
+# --------------------------------------------------------------------------- #
+
+async def _tool_log_score(args: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    subject = _subject_arg(args.get("subject"))
+    value = progress.parse_value(args.get("value"), kind=progress.KIND_SCORE)
+
+    # Шкалу берём из аргумента, иначе — известный максимум для этого экзамена.
+    # Без шкалы полоса на графике теряет смысл: 680 само по себе ничего не значит.
+    scale = args.get("scale")
+    scale_value = float(scale) if scale else progress.DEFAULT_SCALES.get(subject)
+    if scale_value and value > scale_value:
+        raise ValueError(
+            f"Балл {value:g} больше максимума шкалы ({scale_value:g}). "
+            "Уточни значение или передай правильный scale."
+        )
+
+    entry = await db.add_progress(
+        kind=progress.KIND_SCORE,
+        subject=subject,
+        value=value,
+        scale=scale_value,
+        note=_note_arg(args),
+        occurred_on=args.get("occurred_on_local"),
+    )
+    return {
+        "ok": True,
+        "entry": _dump_progress(entry),
+        "today_local": datetime.now(settings.tz).strftime("%Y-%m-%d"),
+    }
+
+
+async def _tool_log_hours(args: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    subject = _subject_arg(args.get("subject"))
+    hours = progress.parse_value(args.get("hours"), kind=progress.KIND_HOURS)
+
+    entry = await db.add_progress(
+        kind=progress.KIND_HOURS,
+        subject=subject,
+        value=hours,
+        note=_note_arg(args),
+        occurred_on=args.get("occurred_on_local"),
+    )
+    return {
+        "ok": True,
+        "entry": _dump_progress(entry),
+        "today_local": datetime.now(settings.tz).strftime("%Y-%m-%d"),
+    }
+
+
+async def _tool_get_progress(args: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    days = int(args.get("days") or 7)
+    days = max(1, min(days, 180))
+
+    subject = _subject_arg(args["subject"]) if args.get("subject") else None
+
+    until = datetime.now(settings.tz).date()
+    since = (until - timedelta(days=days - 1)).isoformat()
+
+    data = progress.summarize(await db.list_progress(subject=subject), since=since)
+    scores, hours = progress.select(data, subject)
+
+    return {
+        "ok": True,
+        "today_local": until.isoformat(),
+        "hours_period_days": days,
+        "hours_since": since,
+        "scores": scores,
+        "hours": hours,
+        "hours_total": sum(item["total"] for item in hours.values()),
+    }
+
+
+# --------------------------------------------------------------------------- #
 #  Вспомогательные функции
 # --------------------------------------------------------------------------- #
 
 def _pick(value: Any, allowed: Sequence[str], default: str) -> str:
     """Вернуть значение, если оно из белого списка, иначе default."""
     return value if isinstance(value, str) and value in allowed else default
+
+
+def _recurrence_arg(raw: Any) -> str | None:
+    """Разобрать правило повторения из аргументов модели.
+
+    None и слова-отказы означают «дело разовое»: модели проще сказать 'none',
+    чем не передать поле вовсе. Мусор вернёт ValueError из recurrence.dump —
+    execute_tool отдаст его модели текстом, и она исправится.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in {"", "none", "no", "off", "нет", "никогда"}:
+        return None
+    return recurrence.dump(text)
+
+
+def _subject_arg(raw: Any) -> str:
+    """Предмет прогресса из белого списка. Незнакомый — ошибка для модели."""
+    subject = progress.resolve_subject(raw)
+    if subject is None:
+        raise ValueError(
+            f"Неизвестный предмет {raw!r}. Доступные: {', '.join(progress.SUBJECTS)}."
+        )
+    return subject
+
+
+def _note_arg(args: dict[str, Any]) -> str | None:
+    """Необязательная заметка к записи прогресса."""
+    return str(args["note"]).strip() if args.get("note") else None
+
+
+def _dump_progress(entry: dict[str, Any]) -> dict[str, Any]:
+    """Компактное представление записи прогресса для модели."""
+    result: dict[str, Any] = {
+        "id": entry["id"],
+        "kind": entry["kind"],
+        "subject": progress.subject_label(entry["subject"]),
+        "value": entry["value"],
+        "display": progress.format_value(entry["kind"], entry["value"]),
+        "occurred_on": entry["occurred_on"],
+    }
+    if entry.get("scale"):
+        result["scale"] = entry["scale"]
+    if entry.get("note"):
+        result["note"] = entry["note"]
+    return result
 
 
 def _parse_due(raw: Any, settings: Settings, *, allow_past: bool) -> datetime | None:
@@ -457,9 +721,19 @@ async def _resolve_task_id(args: dict[str, Any], settings: Settings) -> int:
     return int(matches[0]["id"])
 
 
+def _recurrence_label(rule: str | None) -> str | None:
+    """Подпись правила повторения. Битое правило отдаём как есть, а не роняем ответ."""
+    if not rule:
+        return None
+    try:
+        return recurrence.label(rule)
+    except ValueError:
+        return str(rule)
+
+
 def _dump(task: dict[str, Any], settings: Settings) -> dict[str, Any]:
     """Компактное представление задачи для модели (и для JSON-ответа инструмента)."""
-    return {
+    result: dict[str, Any] = {
         "id": task["id"],
         "title": task["title"],
         "due_local": timeutil.fmt_day(task.get("due_at"), settings.tz),
@@ -476,3 +750,15 @@ def _dump(task: dict[str, Any], settings: Settings) -> dict[str, Any]:
             if not item.get("sent_at")
         ],
     }
+
+    if task.get("recurrence"):
+        result["recurrence"] = _recurrence_label(task["recurrence"])
+
+    # Появляется только у complete_task: следующая задача серии, которую
+    # он создал. Модель должна сказать о ней, а не оставить пользователя
+    # в неведении, что серия продолжилась.
+    next_task = task.get("next_task")
+    if next_task:
+        result["next_occurrence_local"] = timeutil.fmt_day(next_task.get("due_at"), settings.tz)
+
+    return result
