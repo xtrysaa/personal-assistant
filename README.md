@@ -438,6 +438,28 @@ curl -fL https://raw.githubusercontent.com/xtrysaa/personal-assistant/main/deplo
 bash bootstrap.sh          # обновит код, зависимости и перезапустит сервис
 ```
 
+Обновление копированием, вручную (на сервере нет `git`):
+
+```bash
+# 1. локально — скопировать код прямо в целевой каталог
+scp -i <ключ> bot/*.py opc@<хост>:/opt/assistant/bot/
+scp -i <ключ> run.py opc@<хост>:/opt/assistant/
+
+# 2. на сервере — сбросить кэш байткода и перезапустить
+cd /opt/assistant && rm -rf bot/__pycache__
+.venv/bin/python -m compileall -q bot run.py     # поймать опечатки до перезапуска
+sudo systemctl restart assistant-bot
+journalctl -u assistant-bot -n 20 | grep 'База готова'
+```
+
+> **Копировать файлы через `/tmp` нельзя, если это юнит systemd.** При
+> `scp` в `/tmp` файл получает метку SELinux `user_tmp_t`, а `mv` её сохраняет —
+> и systemd отказывается видеть юнит: `Unit assistant-bot.service not found`,
+> при том что старый процесс продолжает работать и выглядит живым. Лечится
+> `sudo restorecon -v /etc/systemd/system/assistant-bot.service` и
+> `sudo systemctl daemon-reload`. Надёжнее писать юнит через `sudo tee`
+> (так делает `bootstrap-standalone.sh`) или копировать сразу в целевой путь.
+
 Если ставил через `git` (вариант А из 4.3):
 
 ```bash
