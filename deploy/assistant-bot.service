@@ -7,8 +7,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=opc
-WorkingDirectory=/home/opc/assistant
-ExecStart=/home/opc/assistant/.venv/bin/python run.py
+# Путь именно /opt, а не домашняя папка: при SELinux в режиме Enforcing
+# systemd не может исполнить бинарник из /home (метка user_home_t) и сервис
+# падает с `status=203/EXEC Permission denied`.
+WorkingDirectory=/opt/assistant
+ExecStart=/opt/assistant/.venv/bin/python run.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1

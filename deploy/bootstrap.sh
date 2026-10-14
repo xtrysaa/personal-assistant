@@ -12,10 +12,14 @@
 #
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-$HOME/assistant}"
+# Именно /opt, а не домашняя папка: при SELinux в режиме Enforcing systemd
+# не может исполнить бинарник из /home (метка user_home_t) и сервис падает
+# с `status=203/EXEC Permission denied`.
+APP_DIR="${APP_DIR:-/opt/assistant}"
 PYTHON="${PYTHON:-python3.11}"
 REPO_URL="${REPO_URL:-https://github.com/xtrysaa/personal-assistant.git}"
 SWAP_MB="${SWAP_MB:-2048}"
+OWNER="$(id -un)"
 
 log() { printf '\n=== %s ===\n' "$1"; }
 
@@ -44,6 +48,10 @@ echo "$PYTHON: $("$PYTHON" --version 2>&1)"
 
 # --------------------------------------------------------------------------- #
 log "3. Код проекта"
+# /opt принадлежит root, поэтому сначала создаём каталог и отдаём его пользователю —
+# дальше git работает без sudo и файлы не остаются root-овыми.
+sudo mkdir -p "$APP_DIR"
+sudo chown "$OWNER" "$APP_DIR"
 if [ -d "$APP_DIR/.git" ]; then
     git -C "$APP_DIR" pull --ff-only
 else
@@ -73,7 +81,9 @@ echo ".env на месте (права 600)"
 
 # --------------------------------------------------------------------------- #
 log "6. Автозапуск через systemd"
-sudo cp deploy/assistant-bot.service /etc/systemd/system/assistant-bot.service
+# В юните зашиты пути /opt/assistant и User=opc — правим под эту машину
+sed "s#/opt/assistant#$APP_DIR#g; s#^User=.*#User=$OWNER#" \
+    deploy/assistant-bot.service | sudo tee /etc/systemd/system/assistant-bot.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable assistant-bot
 sudo systemctl restart assistant-bot

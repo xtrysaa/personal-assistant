@@ -7,30 +7,39 @@
 # и может подвесить sshd. Здесь системные пакеты не трогаются вообще:
 #   * Python скачивается готовой сборкой (python-build-standalone);
 #   * код берётся архивом с GitHub, а не через git clone.
-# Подходит и для любого другого Linux (Debian, Ubuntu, Alpine — везде, где есть curl и tar).
+# Подходит и для любого другого Linux (Debian, Ubuntu, RHEL-семейство —
+# везде, где есть curl, tar и sudo).
+#
+# ПОЧЕМУ /opt, А НЕ ДОМАШНЯЯ ПАПКА
+# На Oracle Linux / RHEL включён SELinux в режиме Enforcing. Файлы в /home
+# помечены как user_home_t, и systemd (служебный домен) такой бинарник
+# исполнить не может — сервис падает с `status=203/EXEC Permission denied`,
+# хотя вручную из терминала всё запускается (там домен unconfined_t).
+# В /opt контексты корректные, поэтому рантайм и приложение кладём туда.
 #
 # Использование на сервере:
 #     bash deploy/bootstrap-standalone.sh
 #
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-$HOME/assistant}"
+APP_DIR="${APP_DIR:-/opt/assistant}"
+PY_ROOT="${PY_ROOT:-/opt/python3.11}"
 PY_SERIES="${PY_SERIES:-3.11}"
-PY_ROOT="${PY_ROOT:-$HOME/.local/python}"
 ARCH="$(uname -m)"
 LIBC="unknown-linux-gnu"
-[ "$ARCH" = "aarch64" ] && LIBC="unknown-linux-gnu"   # имя сборки совпадает
 REPO_TARBALL="${REPO_TARBALL:-https://github.com/xtrysaa/personal-assistant/archive/refs/heads/main.tar.gz}"
 SWAP_MB="${SWAP_MB:-2048}"
+OWNER="$(id -un)"
 
 log() { printf '\n=== %s ===\n' "$1"; }
 
 # --------------------------------------------------------------------------- #
 log "1. Базовые утилиты"
-for tool in curl tar; do
+for tool in curl tar sudo; do
     command -v "$tool" >/dev/null || { echo "ОШИБКА: нет $tool"; exit 1; }
 done
-echo "curl и tar на месте ($ARCH)"
+sudo -n true 2>/dev/null || { echo "ОШИБКА: sudo требует пароль, а установка неинтерактивная"; exit 1; }
+echo "curl, tar и sudo на месте ($ARCH)"
 
 # --------------------------------------------------------------------------- #
 log "2. Swap ${SWAP_MB} МБ (страховка для pip)"
@@ -50,7 +59,7 @@ fi
 free -m | tail -2
 
 # --------------------------------------------------------------------------- #
-log "3. Python ${PY_SERIES} готовой сборкой"
+log "3. Python ${PY_SERIES} готовой сборкой -> $PY_ROOT"
 if [ -x "$PY_ROOT/bin/python3" ] && "$PY_ROOT/bin/python3" --version >/dev/null 2>&1; then
     echo "уже установлен: $("$PY_ROOT/bin/python3" --version 2>&1)"
 else
@@ -70,23 +79,27 @@ else
     fi
     echo "качаю: $TARBALL_URL"
 
-    mkdir -p "$(dirname "$PY_ROOT")"
     curl -fL "$TARBALL_URL" -o /tmp/python-standalone.tar.gz
-    # В архиве верхний каталог python/ — распаковываем в родителя PY_ROOT
-    tar -xzf /tmp/python-standalone.tar.gz -C "$(dirname "$PY_ROOT")"
-    rm -f /tmp/python-standalone.tar.gz
+    # В архиве единственный верхний каталог python/ — переносим его целиком,
+    # чтобы не разбирать дерево по частям (venv потом ссылается на этот путь).
+    TMP_EXTRACT="$(mktemp -d)"
+    tar -xzf /tmp/python-standalone.tar.gz -C "$TMP_EXTRACT"
+    sudo mkdir -p "$(dirname "$PY_ROOT")"
+    sudo rm -rf "$PY_ROOT"
+    sudo mv "$TMP_EXTRACT/python" "$PY_ROOT"
+    rm -rf "$TMP_EXTRACT" /tmp/python-standalone.tar.gz
     echo "установлен: $("$PY_ROOT/bin/python3" --version 2>&1)"
 fi
+sudo chown -R "$OWNER" "$PY_ROOT"
 
 # --------------------------------------------------------------------------- #
-log "4. Код проекта (архивом, без git)"
-if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/run.py" ]; then
-    echo "обновляю существующую копию в $APP_DIR"
-fi
-mkdir -p "$APP_DIR"
+log "4. Код проекта архивом (без git) -> $APP_DIR"
+sudo mkdir -p "$APP_DIR"
 curl -fL "$REPO_TARBALL" -o /tmp/app.tar.gz
-tar -xzf /tmp/app.tar.gz -C "$APP_DIR" --strip-components=1
+# Распаковываем поверх существующей копии: .env в архиве нет, он не затрётся
+sudo tar -xzf /tmp/app.tar.gz -C "$APP_DIR" --strip-components=1
 rm -f /tmp/app.tar.gz
+sudo chown -R "$OWNER" "$APP_DIR"
 cd "$APP_DIR"
 echo "файлов: $(find . -type f -not -path './.venv/*' | wc -l)"
 
@@ -100,25 +113,41 @@ log "5. Виртуальное окружение и зависимости"
 echo "готово: $(.venv/bin/pip list --format=freeze | wc -l) пакетов"
 
 # --------------------------------------------------------------------------- #
-log "6. Настройки"
+log "6. Метки SELinux (иначе systemd не сможет запустить бинарник)"
+if command -v getenforce >/dev/null && [ "$(getenforce)" != "Disabled" ]; then
+    sudo chcon -R -t bin_t "$PY_ROOT/bin"
+    sudo chcon -R -t lib_t "$PY_ROOT/lib"
+    sudo restorecon -R "$APP_DIR" >/dev/null 2>&1 || true
+    echo "режим: $(getenforce), метки проставлены"
+    # Замечание: chcon не переживает полный relabel файловой системы.
+    # Если когда-нибудь понадобится закрепить навсегда (нужен dnf):
+    #   sudo semanage fcontext -a -t bin_t "$PY_ROOT/bin(/.*)?"
+    #   sudo semanage fcontext -a -t lib_t "$PY_ROOT/lib(/.*)?"
+    #   sudo restorecon -R "$PY_ROOT"
+else
+    echo "SELinux выключен или отсутствует — шаг пропущен"
+fi
+
+# --------------------------------------------------------------------------- #
+log "7. Настройки"
 if [ ! -f .env ]; then
     echo "ВНИМАНИЕ: нет файла $APP_DIR/.env"
     echo "Скопируй с локальной машины:"
-    echo "  scp -i ключ.key .env opc@<IP>:$APP_DIR/.env"
+    echo "  scp -i ключ.key .env $(id -un)@<IP>:$APP_DIR/.env"
     exit 1
 fi
 chmod 600 .env
 echo ".env на месте (права 600)"
 
 # --------------------------------------------------------------------------- #
-log "7. Проверка логики (без сети и Telegram)"
+log "8. Проверка логики (без сети и Telegram)"
 .venv/bin/python scripts/smoke_test.py | tail -3
 
 # --------------------------------------------------------------------------- #
-log "8. Автозапуск через systemd"
+log "9. Автозапуск через systemd"
 if [ -f deploy/assistant-bot.service ]; then
-    # В юните зашиты пути /home/opc/assistant — правим, если APP_DIR другой
-    sed "s#/home/opc/assistant#$APP_DIR#g; s#^User=.*#User=$(id -un)#" \
+    # В юните зашиты пути /opt/assistant и User=opc — правим под эту машину
+    sed "s#/opt/assistant#$APP_DIR#g; s#^User=.*#User=$OWNER#" \
         deploy/assistant-bot.service | sudo tee /etc/systemd/system/assistant-bot.service >/dev/null
     sudo systemctl daemon-reload
     sudo systemctl enable assistant-bot >/dev/null 2>&1

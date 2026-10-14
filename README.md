@@ -241,137 +241,172 @@ INFO Бот запущен: @alnur_assistant_bot | часовой пояс: Asia
 > в ожидании апдейтов), но `pip install` на такой памяти иногда падает — поэтому шаг 4.2
 > начинается с создания swap-файла.
 
-### 4.2. Зайти по SSH и поставить Python
+### 4.2. Установка одной командой
 
-Для Oracle Linux 9 пользователь по умолчанию — **`opc`** (не `ubuntu`):
+> **Сначала про память.** На E2.1.Micro доступно ~500 МБ RAM. `sudo dnf install python3.11`
+> на такой машине уходит в многоминутный свопинг и способен подвесить `sshd` так, что
+> перестаёт отвечать даже SSH-сессия. Поэтому в репозитории есть
+> [deploy/bootstrap-standalone.sh](deploy/bootstrap-standalone.sh) — он **не трогает
+> системные пакеты вообще**: Python скачивается готовой сборкой, а код берётся архивом
+> с GitHub. Из системного нужны только `curl`, `tar` и `sudo`.
+
+Сначала скопируем секреты (каталог создаём заранее, чтобы `scp` было куда писать):
+
+```bash
+# локально, из папки проекта
+ssh -i путь/до/ключа.key opc@<PUBLIC_IP> 'sudo mkdir -p /opt/assistant && sudo chown opc /opt/assistant'
+scp -i путь/до/ключа.key .env opc@<PUBLIC_IP>:/opt/assistant/.env
+```
+
+Затем на сервере:
 
 ```bash
 ssh -i путь/до/ключа.key opc@<PUBLIC_IP>
 
-# 2 ГБ swap — страховка от OOM при установке зависимостей на 1 ГБ RAM
+curl -fL https://raw.githubusercontent.com/xtrysaa/personal-assistant/main/deploy/bootstrap-standalone.sh -o bootstrap.sh
+bash bootstrap.sh
+```
+
+Скрипт идемпотентен — повторный запуск пропускает уже сделанное. Что он делает:
+
+1. проверяет наличие `curl`, `tar`, `sudo`;
+2. поднимает swap на 2 ГБ (страховка для `pip`);
+3. ставит Python 3.11 готовой сборкой в `/opt/python3.11` (~8 секунд вместо получаса свопинга);
+4. распаковывает код в `/opt/assistant` (существующий `.env` не затирается — его нет в архиве);
+5. создаёт `.venv` и ставит зависимости;
+6. проставляет метки SELinux — без этого шага сервис не запустится, [см. 4.4](#44-почему-opt-а-не-домашняя-папка);
+7. проверяет `.env` и выставляет права `600`;
+8. прогоняет `scripts/smoke_test.py`;
+9. ставит systemd-юнит и запускает сервис.
+
+В конце должно быть `active (running)` и строка `Бот запущен: @... | часовой пояс: ...`.
+Если видишь `activating` и `status=203/EXEC` — это SELinux, разбор в 4.4.
+
+> Порты, `firewalld` и VCN Security List трогать **не нужно**: Telegram работает через
+> исходящие соединения, публичный домен и SSL не требуются. Входящий SSH (22) открыт
+> по умолчанию.
+
+### 4.3. Установка вручную
+
+Если хочешь пройти по шагам сам (или готовая сборка Python не нашлась для твоей архитектуры):
+
+```bash
+# 2 ГБ swap — страховка от OOM при pip install на 500 МБ RAM
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
 sudo mkswap /swapfile && sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
-sudo dnf update -y
 sudo dnf install -y git python3.11 python3.11-pip
 ```
 
-**Зачем именно python3.11, а не системный python3:** в Oracle Linux 9 по умолчанию
-Python 3.9, а проекту нужен **3.10 минимум** (`@dataclass(slots=True)` в
-[bot/config.py](bot/config.py) на 3.9 не работает).
+**Зачем python3.11, а не системный python3:** в Oracle Linux 9 по умолчанию Python 3.9,
+а проекту нужен **минимум 3.10** (`@dataclass(slots=True)` в [bot/config.py](bot/config.py)
+на 3.9 не работает).
 
-Проверить, что нужная версия встала, и при желании найти другие:
-
-```bash
-python3.11 --version                  # ожидаем Python 3.11.x
-dnf list available 'python3.1*'       # если нужен 3.12 — он тоже есть в AppStream
-```
-
-На заметку: `ufw`/`firewalld` и порты открывать **не нужно** — Telegram работает через
-исходящие соединения, публичный домен и SSL не требуются. Единственное, что стоит разрешить
-в VCN Security List — входящий SSH (22), он открыт по умолчанию.
-
-### 4.3. Загрузить проект
-
-Вариант А (через GitHub — рекомендую, потом легко обновлять):
+Код кладём в `/opt` (почему именно туда — в 4.4):
 
 ```bash
-# локально: залей проект в свой репозиторий (в .gitignore уже исключены .env и data/)
-git init && git add . && git commit -m "Personal assistant bot"
-git remote add origin https://github.com/<username>/<repo>.git && git push -u origin main
+# А. через git — каталог в /opt принадлежит root, поэтому сначала отдаём его себе
+sudo mkdir -p /opt/assistant && sudo chown "$(id -un)" /opt/assistant
+git clone https://github.com/<username>/<repo>.git /opt/assistant
 
-# на сервере:
-git clone https://github.com/<username>/<repo>.git assistant
-```
-
-Вариант Б (копированием файлов, без git):
-
-```bash
-# локально, из папки проекта (исключаем .venv и базу):
-scp -i ключ.key -r bot scripts run.py requirements.txt Dockerfile README.md opc@<IP>:/home/opc/assistant/
+# Б. копированием файлов (локально, из папки проекта)
+scp -i ключ.key -r bot scripts run.py requirements.txt README.md deploy opc@<IP>:/opt/assistant/
 ```
 
 Дальше на сервере:
 
 ```bash
-cd ~/assistant
+cd /opt/assistant
 python3.11 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 
-# создаём .env и заполняем значения из локального .env (в nano: Ctrl+O сохранить, Ctrl+X выйти)
-nano .env
+# .env из шага 4.2 уже на месте; если нет — заполни в nano (Ctrl+O сохранить, Ctrl+X выйти)
 chmod 600 .env
+.venv/bin/python scripts/smoke_test.py    # Все проверки пройдены
 ```
 
-> `.env` в репозиторий не попадает — перенеси значения вручную или скопируй файл
-> отдельной командой `scp -i ключ.key .env opc@<IP>:/home/opc/assistant/.env`.
->
 > Если репозиторий приватный, `git clone` попросит логин и пароль — вместо пароля
 > нужен Personal Access Token: `git clone https://<USERNAME>:<TOKEN>@github.com/<USERNAME>/<repo>.git`
 
-Проверка, что всё живое:
+Проверить вручную, до всякого systemd:
 
 ```bash
-.venv/bin/python scripts/smoke_test.py    # Все проверки пройдены
-.venv/bin/python run.py                   # запустится, напиши боту, потом Ctrl+C
+.venv/bin/python run.py    # ждём строку «Бот запущен», напиши боту, потом Ctrl+C
 ```
 
-### 4.4. Автозапуск через systemd
+### 4.4. Почему `/opt`, а не домашняя папка
 
-Создай юнит:
+На Oracle Linux включён **SELinux в режиме Enforcing**. Файлы в `/home` помечены типом
+`user_home_t`, а systemd запускает сервис в служебном домене, которому исполнять такие
+бинарники запрещено. Симптом обманчивый: из терминала `./venv/bin/python run.py`
+запускается без проблем (там домен `unconfined_t`), а сервис циклически падает:
+
+```
+Failed to locate executable /home/opc/assistant/.venv/bin/python: Permission denied
+Main process exited, code=exited, status=203/EXEC
+```
+
+`sudo systemctl status` при этом показывает `activating (auto-restart)` — сервис
+бесконечно перезапускается, и по статусу не понять, что дело в правах.
+
+В `/opt` контексты корректные, поэтому и рантайм, и приложение кладём туда. Скрипт
+из 4.2 дополнительно проставляет метки явно:
 
 ```bash
-sudo nano /etc/systemd/system/assistant-bot.service
+sudo chcon -R -t bin_t /opt/python3.11/bin
+sudo chcon -R -t lib_t /opt/python3.11/lib
+sudo restorecon -R /opt/assistant
 ```
 
-```ini
-[Unit]
-Description=Personal AI assistant Telegram bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=opc
-WorkingDirectory=/home/opc/assistant
-ExecStart=/home/opc/assistant/.venv/bin/python run.py
-Restart=always
-RestartSec=10
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Включи и запусти:
+`chcon` не переживает полный relabel файловой системы. Если захочешь закрепить навсегда
+(понадобится `sudo dnf install policycoreutils-python-utils`):
 
 ```bash
+sudo semanage fcontext -a -t bin_t "/opt/python3.11/bin(/.*)?"
+sudo semanage fcontext -a -t lib_t "/opt/python3.11/lib(/.*)?"
+sudo restorecon -R /opt/python3.11
+```
+
+### 4.5. Автозапуск через systemd
+
+Скрипт из 4.2 прописывает юнит сам. Вручную — так:
+
+```bash
+# в юните зашит User=opc — подставляем текущего пользователя
+sed "s#^User=.*#User=$(id -un)#" /opt/assistant/deploy/assistant-bot.service \
+    | sudo tee /etc/systemd/system/assistant-bot.service >/dev/null
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now assistant-bot
 sudo systemctl status assistant-bot        # active (running)
 journalctl -u assistant-bot -f             # живой лог (Ctrl+C — выйти)
 ```
 
-Всё: бот работает 24/7 и сам поднимется после перезагрузки сервера.
-Порт наружу открывать не нужно — Telegram работает через исходящие соединения,
-`HEALTH_PORT` оставь пустым.
+Готовый юнит лежит в [deploy/assistant-bot.service](deploy/assistant-bot.service).
 
-### 4.5. Обновить код на сервере
+Всё: бот работает 24/7 и сам поднимется после перезагрузки сервера.
+
+### 4.6. Обновить код на сервере
 
 ```bash
-cd ~/assistant
-git pull
-.venv/bin/pip install -r requirements.txt
-sudo systemctl restart assistant-bot
+curl -fL https://raw.githubusercontent.com/xtrysaa/personal-assistant/main/deploy/bootstrap-standalone.sh -o bootstrap.sh
+bash bootstrap.sh          # обновит код, зависимости и перезапустит сервис
 ```
 
-Совет: сделай `.env` доступным только тебе — `chmod 600 .env`.
-Бэкап базы: `cp data/assistant.db ~/backup-$(date +%F).db` (можно повесить на cron раз в сутки).
+Если ставил через `git` (вариант А из 4.3):
 
-SELinux в Oracle Linux включён, но настроек не требует: бот работает из `/home/opc/assistant`
-и ничего не публикует наружу.
+```bash
+sudo systemctl stop assistant-bot
+cd /opt/assistant && git pull
+.venv/bin/pip install -r requirements.txt
+sudo systemctl start assistant-bot
+```
+
+Совет: сделай `.env` доступным только тебе — `chmod 600 .env` (скрипт уже это делает).
+Бэкап базы: `cp /opt/assistant/data/assistant.db ~/backup-$(date +%F).db`
+(можно повесить на cron раз в сутки).
 
 ---
 
