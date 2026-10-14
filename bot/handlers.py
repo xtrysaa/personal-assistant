@@ -43,20 +43,14 @@ PROGRESS_DAYS = 7
 
 HELP_TEXT = """<b>Личный ассистент Альнура</b>
 
-Пиши свободным текстом — я сам разберу, дело это или запись в подготовку,
+Пишите свободным текстом — разберу сам, дело это или запись в подготовку,
 и поставлю напоминания. Можно надиктовать голосовым или прислать фото
-расписания, списка заданий или условия задачи.
+расписания или задания.
 
 <b>Примеры</b>
 ▸ 15 ноября дедлайн подачи документов в Air Astana Ab Initio
-▸ Завтра в 15:00 контрольная по физике
-▸ Каждый вторник и четверг тренировка в 16:00, начиная с этого
-▸ Напомни за месяц до регистрации на IELTS
-▸ Сдал пробник SAT на 680
-▸ Два часа математики
-
-<b>Подготовка</b> — баллы пробников и часы занятий копятся отдельно от дел,
-поэтому по ним видно динамику: /progress.
+▸ Каждый вторник и четверг тренировка в 16:00
+▸ Сдал пробник SAT на 680 · два часа математики
 
 <b>Команды</b>
 /today — дела на сегодня
@@ -67,7 +61,7 @@ HELP_TEXT = """<b>Личный ассистент Альнура</b>
 /add — добавить дело текстом
 /plan — помощь с планированием
 /progress — подготовка: баллы и часы
-/export — выгрузить календарь файлом .ics
+/export — календарь файлом .ics
 /done <code>12</code> — отметить выполненным
 /del <code>12</code> — удалить
 /reset — сбросить контекст диалога
@@ -172,7 +166,7 @@ async def _ask_agent(message: Message, text: str, hint: str | None = None) -> No
         logger.exception("Ошибка обращения к LLM")
         answer = (
             "▸ Модель не ответила — связь потеряна.\n"
-            "Проверь <code>OPENAI_API_KEY</code>, <code>OPENAI_BASE_URL</code> "
+            "Проверьте <code>OPENAI_API_KEY</code>, <code>OPENAI_BASE_URL</code> "
             "и <code>OPENAI_MODEL</code> в <code>.env</code> и лимиты провайдера.\n"
             "Дела при этом в порядке: они лежат в базе, а не в диалоге."
         )
@@ -185,10 +179,8 @@ async def _ask_agent(message: Message, text: str, hint: str | None = None) -> No
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    """Старт: только справка — примеры уже внутри неё."""
     await _reply(message, HELP_TEXT)
-    await message.answer(
-        "С чего начнём? Например: <i>«15 ноября дедлайн Air Astana Ab Initio»</i>"
-    )
 
 
 @router.message(Command("help"))
@@ -231,7 +223,7 @@ async def cmd_all(message: Message) -> None:
 @router.message(Command("overdue"))
 async def cmd_overdue(message: Message) -> None:
     tasks = await db.list_tasks(status="open", end=timeutil.now_utc(), limit=40)
-    await _send_tasks(message, "⚠️ Просрочено", tasks, "Просроченного нет — красота.")
+    await _send_tasks(message, "⚠️ Просрочено", tasks, "Просроченного нет.")
 
 
 @router.message(Command("add"))
@@ -239,7 +231,7 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
     text = (command.args or "").strip()
     if not text:
         await message.answer(
-            "▸ Напиши, что добавить. Пример:\n"
+            "▸ Напишите, что добавить. Пример:\n"
             "<code>/add 15 ноября дедлайн подачи документов Air Astana</code>"
         )
         return
@@ -376,7 +368,7 @@ def _done_text(task: dict[str, Any], task_id: int) -> str:
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     """Подсказка для настройки OWNER_TELEGRAM_ID."""
-    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
 
 
 def _parse_id(raw: str | None) -> int | None:
@@ -445,9 +437,9 @@ async def handle_voice(message: Message, bot: Bot) -> None:
     if not stt.is_configured(settings):
         await message.answer(
             "▸ Голосовые пока не настроены.\n"
-            "Добавь в <code>.env</code> бесплатный ключ Groq (console.groq.com):\n"
+            "Добавьте в <code>.env</code> бесплатный ключ Groq (console.groq.com):\n"
             "<code>STT_API_KEY=gsk_...</code>\n"
-            "и перезапусти бота. Либо напиши текстом."
+            "и перезапустите бота. Либо напишите текстом."
         )
         return
 
@@ -461,11 +453,11 @@ async def handle_voice(message: Message, bot: Bot) -> None:
         transcript = await stt.transcribe(buffer.getvalue(), filename, settings)
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось расшифровать голосовое")
-        await status.edit_text("▸ Не получилось распознать. Скажи ещё раз или напиши текстом.")
+        await status.edit_text("▸ Не получилось распознать. Скажите ещё раз или напишите текстом.")
         return
 
     if not transcript:
-        await status.edit_text("▸ Речь не разобрал — попробуй ближе к микрофону.")
+        await status.edit_text("▸ Речь не разобрал — попробуйте ближе к микрофону.")
         return
 
     # Показываем расшифровку: если модель что-то поняла не так, это будет видно.
@@ -495,7 +487,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
         limit = llm.IMAGE_MAX_BYTES // (1024 * 1024)
         await message.answer(
             f"▸ Снимок больше {limit} МБ — такой я не разберу.\n"
-            "Пришли скриншот или фото меньшего размера либо напиши словами."
+            "Пришлите скриншот или фото меньшего размера либо опишите словами."
         )
         return
 
@@ -520,8 +512,8 @@ async def handle_photo(message: Message, bot: Bot) -> None:
     except Exception:  # noqa: BLE001 — пользователь должен увидеть внятную реакцию
         logger.exception("Не удалось разобрать изображение")
         await status.edit_text(
-            "▸ Не получилось разобрать изображение. Пришли его ещё раз "
-            "или напиши дедлайн словами."
+            "▸ Не получилось разобрать изображение. Пришлите его ещё раз "
+            "или опишите срок словами."
         )
         return
 
@@ -565,7 +557,7 @@ async def handle_unknown_command(message: Message) -> None:
 async def handle_other(message: Message) -> None:
     """Стикеры, документы, видео и прочее, что бот не разбирает."""
     await message.answer(
-        "▸ Понимаю текст, голосовые и фото. Пришли расписание снимком или "
-        "напиши словами — например:\n"
+        "▸ Понимаю текст, голосовые и фото. Пришлите расписание снимком "
+        "или опишите словами — например:\n"
         "<i>«в пятницу в 18:00 занятие с репетитором по математике»</i>"
     )

@@ -344,7 +344,7 @@ async def run_agent(
                 }
             )
 
-    fallback = "Слишком много шагов подряд. Напиши, пожалуйста, запрос одним сообщением."
+    fallback = "Слишком много шагов подряд. Напишите, пожалуйста, запрос одним сообщением."
     await db.add_message("assistant", fallback)
     return fallback
 

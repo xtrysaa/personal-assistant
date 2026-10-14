@@ -493,7 +493,7 @@ async def main() -> None:
     check("в историю чек-ин уходит без HTML",
           "<b>" not in plain_checkin and "<i>" not in plain_checkin, plain_checkin)
     check("в историю попадает тот же вопрос",
-          "Итог дня" in plain_checkin and "Что успел сегодня?" in plain_checkin, plain_checkin)
+          "Итог дня" in plain_checkin and "Что успели сегодня?" in plain_checkin, plain_checkin)
 
     # ------------------------------------------------------------------ #
     #  Последней: init_db меняет глобальный _DB_PATH, после неё возвращаем его.
