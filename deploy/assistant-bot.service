@@ -1,0 +1,22 @@
+[Unit]
+Description=Personal AI assistant Telegram bot
+Documentation=https://github.com/xtrysaa/personal-assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/assistant
+ExecStart=/home/opc/assistant/.venv/bin/python run.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+# Небольшая страховка: боту хватает ~80 МБ, больше ему не нужно
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target
