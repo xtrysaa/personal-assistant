@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 from datetime import datetime, timedelta
 from html import escape
 from typing import Any, Sequence
@@ -51,6 +52,9 @@ HELP_TEXT = """<b>Личный ассистент Альнура</b>
 ▸ 15 ноября дедлайн подачи документов в Air Astana Ab Initio
 ▸ Каждый вторник и четверг тренировка в 16:00
 ▸ Сдал пробник SAT на 680 · два часа математики
+
+<b>В списках</b>
+🔴 горит · 🟠 сегодня-завтра · ⚪ спокойно
 
 <b>Команды</b>
 /today — дела на сегодня
@@ -138,30 +142,135 @@ async def _reply(message: Message, text: str, *, sanitize: bool = False) -> None
 
 
 def _tasks_keyboard(tasks: Sequence[dict[str, Any]]) -> InlineKeyboardMarkup | None:
-    """Кнопки «выполнено» под списком задач."""
-    rows = [
-        [InlineKeyboardButton(text=f"✅ #{task['id']}", callback_data=f"done:{task['id']}")]
+    """Кнопки «выполнено» под списком задач.
+
+    По три в ряд: в столбик двенадцать кнопок растягивают сообщение сильнее,
+    чем сам список дел.
+    """
+    buttons = [
+        InlineKeyboardButton(text=f"✅ {task['id']}", callback_data=f"done:{task['id']}")
         for task in tasks[:MAX_BUTTONS]
     ]
+    rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-async def _send_tasks(message: Message, title: str, tasks: list[dict[str, Any]], empty: str) -> None:
+async def _send_tasks(
+    message: Message,
+    title: str,
+    tasks: list[dict[str, Any]],
+    empty: str,
+    *,
+    group_days: bool = True,
+) -> None:
     """Показать список задач с кнопками закрытия."""
     if not tasks:
         await message.answer(f"<b>{title}</b>\n<i>{empty}</i>")
         return
 
     settings = get_settings()
-    text = f"<b>{title}</b> · {len(tasks)}\n\n{formatting.task_list(tasks, settings.tz)}"
+    body = formatting.task_list(tasks, settings.tz, group_days=group_days)
+    text = f"<b>{title}</b> · {len(tasks)}\n\n{body}"
+
+    # Расшифровка кружков — одна на сообщение и только если кружки разные.
+    legend = formatting.urgency_legend(tasks, settings.tz)
+    if legend:
+        text += f"\n\n{legend}"
+
     await message.answer(text, reply_markup=_tasks_keyboard(tasks))
+
+
+class StreamedReply:
+    """Ответ, который дописывается в чат по мере генерации.
+
+    Модель отвечает несколько секунд, и без этого всё это время в чате висит
+    только «печатает…» — ожидание ощущается как зависание. Здесь первые слова
+    появляются примерно через секунду после запроса.
+
+    Устройство класса задают три ограничения Telegram:
+      * править сообщение чаще раза в секунду нельзя — упрёшься в лимиты,
+        поэтому текст обновляется не на каждый токен, а с паузой INTERVAL;
+      * незаконченная разметка («<b» без закрывающей скобки) ломает парсер,
+        поэтому текст прогоняется через sanitize_html — недописанный тег
+        превращается в обычный текст и не роняет отправку;
+      * сообщение всё равно ограничено 4096 символами.
+
+    Любая неудачная правка — не беда: она ловится и просто пропускается.
+    Финальный ответ отправляется независимо от того, как прошёл стрим.
+
+    Отдельного «секунду…» до первого слова нет намеренно: паузу до ответа
+    закрывает индикатор «печатает», а лишнее сообщение пришлось бы потом
+    удалять — два подряд выглядят как сбой.
+    """
+
+    #: Минимальная пауза между правками сообщения.
+    INTERVAL = 1.1
+
+    #: Сколько символов показывать в предварительном тексте.
+    LIMIT = 3800
+
+    def __init__(self, message: Message) -> None:
+        self._origin = message
+        self._sent: Message | None = None
+        self._shown = ""       # что уже отправлено (в исходном виде)
+        self._shown_body = ""  # и как это выглядит после sanitize_html
+        self._last_edit = 0.0
+
+    async def push(self, text: str) -> None:
+        """Показать накопленный текст. Вызывается агентом по ходу генерации."""
+        text = text.strip()
+        if not text or text == self._shown:
+            return
+
+        now = time.monotonic()
+        # Первый кусок показываем сразу (_last_edit = 0), дальше — с паузой.
+        if now - self._last_edit < self.INTERVAL:
+            return
+
+        body = formatting.sanitize_html(text)[: self.LIMIT]
+        if body == self._shown_body:
+            return
+        self._last_edit = now
+
+        try:
+            if self._sent is None:
+                self._sent = await self._origin.answer(body)
+            else:
+                await self._sent.edit_text(body)
+        except Exception:  # noqa: BLE001 — неудачная правка не должна ронять ответ
+            logger.debug("Не удалось обновить предварительный текст", exc_info=True)
+            return
+
+        self._shown = text
+        self._shown_body = body
+
+    async def finish(self, answer: str) -> None:
+        """Показать финальный ответ — уже с разметкой."""
+        parts = _split(formatting.sanitize_html(answer))
+
+        if self._sent is None:
+            # Модель не успела ничего отдать по частям — обычная отправка.
+            for part in parts:
+                await self._origin.answer(part)
+            return
+
+        if parts[0] != self._shown_body:
+            try:
+                await self._sent.edit_text(parts[0])
+            except Exception:  # noqa: BLE001 — гонка правок, «not modified» и прочее
+                logger.debug("Не удалось заменить предварительный текст", exc_info=True)
+                await self._origin.answer(parts[0])
+
+        for part in parts[1:]:
+            await self._origin.answer(part)
 
 
 async def _ask_agent(message: Message, text: str, hint: str | None = None) -> None:
     """Отдать текст модели и ответить пользователю."""
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    reply = StreamedReply(message)
     try:
-        answer = await llm.run_agent(text, hint=hint)
+        answer = await llm.run_agent(text, hint=hint, on_delta=reply.push)
     except Exception:  # noqa: BLE001 — пользователь должен получить внятную реакцию
         logger.exception("Ошибка обращения к LLM")
         answer = (
@@ -170,7 +279,7 @@ async def _ask_agent(message: Message, text: str, hint: str | None = None) -> No
             "и <code>OPENAI_MODEL</code> в <code>.env</code> и лимиты провайдера.\n"
             "Дела при этом в порядке: они лежат в базе, а не в диалоге."
         )
-    await _reply(message, answer, sanitize=True)
+    await reply.finish(answer)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,7 +302,8 @@ async def cmd_today(message: Message) -> None:
     settings = get_settings()
     start, end = timeutil.day_bounds(settings.tz)
     tasks = await db.list_tasks(status="open", start=start, end=end, limit=40)
-    await _send_tasks(message, "📅 Сегодня", tasks, "На сегодня дел нет.")
+    # День уже в шапке — группировать нечего.
+    await _send_tasks(message, "📅 Сегодня", tasks, "На сегодня дел нет.", group_days=False)
 
 
 @router.message(Command("tomorrow"))
@@ -201,7 +311,7 @@ async def cmd_tomorrow(message: Message) -> None:
     settings = get_settings()
     start, end = timeutil.day_bounds(settings.tz, offset_days=1)
     tasks = await db.list_tasks(status="open", start=start, end=end, limit=40)
-    await _send_tasks(message, "📅 Завтра", tasks, "На завтра дел нет.")
+    await _send_tasks(message, "📅 Завтра", tasks, "На завтра дел нет.", group_days=False)
 
 
 @router.message(Command("week"))

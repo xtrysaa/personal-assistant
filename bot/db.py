@@ -49,6 +49,22 @@ _UPDATABLE_FIELDS = frozenset({"title", "details", "category", "priority", "recu
 # У остальных текстовых полей None = «не менять» (см. update_task).
 _NULLABLE_FIELDS = frozenset({"recurrence"})
 
+# Страховочное напоминание для дела, срок которого уже на носу (см.
+# _fallback_reminder): за сколько минут до срока его ставить и на сколько
+# отложить его отправку, если и это время уже прошло.
+_FALLBACK_LEAD_MINUTES = 10
+_FALLBACK_DELAY_SECONDS = 30
+
+# Сколько «догоняющих» напоминаний разрешено отправить за один тик.
+# После долгого простоя (сервер лежал, пропала сеть) их может накопиться
+# несколько десятков — остальные уйдут следующими тиками, раз в минуту.
+_MAX_LATE_PER_TICK = 5
+
+# Сколько пропущенных вхождений серии разрешено перешагнуть, перенося её вперёд
+# (см. _roll_recurrence). Предел — только страховка от бесконечного цикла:
+# ежедневная серия за три года укладывается в тысячу шагов.
+_MAX_ROLL_STEPS = 1000
+
 # Актуальная версия схемы. Свежая база получает её сразу, старая проходит
 # MIGRATIONS шаг за шагом.
 SCHEMA_VERSION = 3
@@ -284,6 +300,30 @@ def _normalize_recurrence(rule: Any) -> str | None:
     return recurrence.dump(str(rule))
 
 
+def _fallback_reminder(due: datetime, now: datetime) -> tuple[int, datetime] | None:
+    """Единственное напоминание для дела, срок которого уже на носу.
+
+    Наборы смещений рассчитаны на то, что дело заводят заранее. Но «тренировка
+    сегодня в 16:00», сказанная в 15:30, не попадает ни в одно из них: «за час»
+    уже прошло, «за сутки» и «за неделю» тем более. Раньше в этом случае у дела
+    не оставалось НИ ОДНОГО напоминания, и бот молчал — при том что модель
+    отвечала «напомню». Ровно так и выглядит «он забывает напоминать».
+
+    Здесь ставим одно напоминание на разумное время: за _FALLBACK_LEAD_MINUTES
+    до срока, а если и это прошло — совсем скоро, но не позже самого срока.
+    """
+    if due <= now:
+        return None
+
+    fire_at = due - timedelta(minutes=_FALLBACK_LEAD_MINUTES)
+    if fire_at <= now:
+        fire_at = min(now + timedelta(seconds=_FALLBACK_DELAY_SECONDS), due)
+
+    # Смещение выводим из фактического момента отправки: иначе подпись
+    # напоминания («за 10 минут») разошлась бы с тем, когда оно придёт.
+    return max(0, round((due - fire_at).total_seconds() / 60)), fire_at
+
+
 async def _sync_reminders(
     connection: aiosqlite.Connection,
     task_id: int,
@@ -297,6 +337,10 @@ async def _sync_reminders(
     напоминания из-за уникального индекса, и после переноса срока напоминание
     просто пропадёт. Напоминания в прошлом не создаём, чтобы после смены даты
     не прилетела пачка старых.
+
+    Но если после этого не осталось ни одного, а срок ещё впереди — ставим
+    страховочное (см. _fallback_reminder). Дело с будущим сроком обязано иметь
+    напоминание: иначе пользователь ждёт его и не получает.
     """
     await connection.execute("DELETE FROM reminders WHERE task_id = ?", (task_id,))
     if not due_iso:
@@ -304,10 +348,19 @@ async def _sync_reminders(
 
     due = timeutil.parse_iso(due_iso)
     now = timeutil.now_utc()
-    for offset in offsets:
-        fire_at = due - timedelta(minutes=offset)
-        if fire_at <= now:
-            continue
+
+    planned = [
+        (offset, due - timedelta(minutes=offset))
+        for offset in offsets
+        if due - timedelta(minutes=offset) > now
+    ]
+    if not planned:
+        fallback = _fallback_reminder(due, now)
+        if fallback is None:  # срок уже прошёл — напоминать поздно
+            return
+        planned = [fallback]
+
+    for offset, fire_at in planned:
         await connection.execute(
             "INSERT OR IGNORE INTO reminders (task_id, offset_minutes, fire_at) VALUES (?, ?, ?)",
             (task_id, offset, fire_at.isoformat()),
@@ -567,18 +620,43 @@ async def _roll_recurrence(before: dict[str, Any]) -> dict[str, Any] | None:
     if not rule or not before.get("due_at"):
         return None
 
+    # Следующее вхождение обязано быть в будущем. Закрыть серию можно и с
+    # опозданием, и тогда «срок + один период» уже прошёл: раньше в этом случае
+    # создавалось дело с прошедшей датой, у которого не оставалось ни одного
+    # напоминания (все сроки срабатывания позади), — и на этом серия застревала
+    # навсегда, потому что следующее закрытие повторяло ту же ошибку. «Каждый
+    # день английский» достаточно было отметить на следующее утро после срока.
+    # Пропущенные вхождения именно пропускаем, а не догоняем задним числом.
+    next_due = timeutil.parse_iso(before["due_at"])
+    now = timeutil.now_utc()
     try:
-        next_due = recurrence.next_due(timeutil.parse_iso(before["due_at"]), rule, _TZ)
+        for _ in range(_MAX_ROLL_STEPS):
+            next_due = recurrence.next_due(next_due, rule, _TZ)
+            if next_due > now:
+                break
+        else:
+            logger.warning(
+                "Серия задачи #%s (%s) не догнала сегодня за %d шагов — не переношу",
+                before["id"], rule, _MAX_ROLL_STEPS,
+            )
+            return None
     except ValueError:
         logger.warning("Не удалось перенести серию задачи #%s: правило %r", before["id"], rule)
         return None
 
-    # Смещения напоминаний переносим с исходной задачи. Если строк не осталось
-    # (например, все сроки срабатывания оказались в прошлом при создании),
-    # берём набор по умолчанию — иначе серия осталась бы совсем без напоминаний.
-    offsets = [int(item["offset_minutes"]) for item in (before.get("reminders") or [])]
-    if not offsets:
+    # Смещения напоминаний переносим с исходной задачи. Но доживший до закрытия
+    # набор — это ещё не то, что просил пользователь: при создании серии «за
+    # сутки» и «за неделю» могли не поместиться (первое вхождение было слишком
+    # близко) и отсеяться, и тогда серия навсегда оставалась с одним «за час»,
+    # хотя следующее вхождение может быть и через четыре дня. Если перенесённые
+    # смещения целиком укладываются в набор по умолчанию, значит серия и была
+    # заведена на нём, — берём его целиком и даём отсеяться заново по новому
+    # сроку. Набор, где есть что-то своё, переносим как есть.
+    carried = [int(item["offset_minutes"]) for item in (before.get("reminders") or [])]
+    if not carried or set(carried) <= set(_DEFAULT_OFFSETS):
         offsets = list(_DEFAULT_OFFSETS)
+    else:
+        offsets = carried
 
     try:
         return await create_task(
@@ -614,9 +692,17 @@ async def due_reminders(
     """Напоминания, которые пора отправить.
 
     Возвращает пару:
-        fresh      — актуальные напоминания (отправляем)
-        stale_ids  — просроченные сильнее, чем `grace` (помечаем отправленными без
-                     отправки, чтобы после долгого простоя не прилетела пачка старых)
+        to_send   — список к отправке. У каждого элемента есть флаг ``late``:
+                    True — напоминание пролежало дольше grace-окна, но срок
+                    задачи ещё не прошёл, и напоминание сохраняет смысл
+                    («пробник завтра» полезно услышать и с опозданием).
+        stale_ids — безнадёжно устаревшие: и напоминание просрочено, и срок уже
+                    прошёл. Помечаем отправленными молча, чтобы после долгого
+                    простоя не прилетела пачка старых.
+
+    Раньше в stale уходило ВСЁ, что старше grace, — и после ночного падения
+    сервера терялись напоминания о делах, до которых ещё оставалось время.
+    Пользователь видел не «сервер лежал», а «бот опять забыл».
     """
     now_iso = now.astimezone(timezone.utc).isoformat()
     floor_iso = (now - grace).astimezone(timezone.utc).isoformat()
@@ -645,9 +731,32 @@ async def due_reminders(
         )
         rows = [dict(row) for row in await cursor.fetchall()]
 
-    fresh = [row for row in rows if row["fire_at"] >= floor_iso]
-    stale_ids = [row["reminder_id"] for row in rows if row["fire_at"] < floor_iso]
-    return fresh, stale_ids
+    on_time: list[dict[str, Any]] = []
+    late: list[dict[str, Any]] = []
+    stale_ids: list[int] = []
+
+    for row in rows:
+        if row["fire_at"] >= floor_iso:
+            row["late"] = False
+            on_time.append(row)
+            continue
+
+        # Напоминание сильно просрочено — но живо ли само дело?
+        due_at = row["due_at"]
+        if due_at and timeutil.parse_iso(due_at) > now:
+            row["late"] = True
+            late.append(row)
+        else:
+            stale_ids.append(row["reminder_id"])
+
+    if len(late) > _MAX_LATE_PER_TICK:
+        # Первыми идут самые горящие: при равном опоздании важнее тот, у кого
+        # срок ближе. Остальные останутся неотправленными и уйдут следующим
+        # тиком — по пять в минуту, а не простынёй на весь экран.
+        late.sort(key=lambda row: row["due_at"] or "")
+        late = late[:_MAX_LATE_PER_TICK]
+
+    return on_time + late, stale_ids
 
 
 async def mark_reminders(reminder_ids: Sequence[int], *, sent: bool = True) -> None:

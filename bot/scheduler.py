@@ -101,7 +101,7 @@ class AssistantScheduler:
     async def _tick_reminders(self) -> None:
         """Раз в минуту: отправить наступившие напоминания."""
         try:
-            fresh, stale_ids = await db.due_reminders(timeutil.now_utc(), REMINDER_GRACE)
+            pending, stale_ids = await db.due_reminders(timeutil.now_utc(), REMINDER_GRACE)
 
             # Просроченные сильнее grace-окна помечаем отправленными молча,
             # иначе после недельного простоя прилетела бы пачка старых напоминаний.
@@ -109,8 +109,13 @@ class AssistantScheduler:
                 await db.mark_reminders(stale_ids, sent=True)
                 logger.info("Пропущено устаревших напоминаний: %d", len(stale_ids))
 
-            for item in fresh:
+            # Здесь могут быть и «догоняющие» — те, что не удалось отправить
+            # вовремя (сервер лежал, сеть пропадала), но чей срок ещё впереди.
+            # Их отдаём с пометкой: молчание выглядит как забывчивость бота.
+            for item in pending:
                 text = formatting.render_reminder(item, self.settings.tz)
+                if item.get("late"):
+                    logger.info("Догоняющее напоминание #%s", item["task_id"])
                 if await self._send(text):
                     await db.mark_reminders([item["reminder_id"]], sent=True)
         except Exception:  # noqa: BLE001 — задание не должно умирать молча
@@ -141,13 +146,19 @@ class AssistantScheduler:
             blocks = [
                 f"☀️ <b>Доброе утро, Альнур</b> · {date_label}",
                 formatting.DIVIDER,
-                self._block("Сегодня", today, empty="На сегодня дел нет — можно спокойно готовиться."),
+                self._block(
+                    "Сегодня",
+                    today,
+                    empty="На сегодня дел нет — можно спокойно готовиться.",
+                    group_days=False,
+                ),
             ]
 
             if overdue:
                 blocks.append(self._block("⚠️ Просрочено", overdue))
 
             blocks.append(self._block("Ближайшая неделя", week, empty="На неделю пока пусто."))
+            blocks.extend(self._legend(today, overdue, week))
 
             if not today and not overdue:
                 blocks.append("<i>Хороший момент, чтобы продвинуть SAT/IELTS или заявку в Air Astana.</i>")
@@ -213,6 +224,7 @@ class AssistantScheduler:
                 blocks.append(f"{formatting.BULLET}Закрытых задач за неделю нет.")
 
             blocks.append(self._block("На следующей неделе", upcoming, empty="Пусто."))
+            blocks.extend(self._legend(upcoming))
 
             if by_category:
                 summary = ", ".join(
@@ -241,12 +253,36 @@ class AssistantScheduler:
     #  Утилиты
     # ------------------------------------------------------------------ #
 
-    def _block(self, title: str, tasks: list[dict[str, Any]], *, empty: str | None = None) -> str:
-        """Секция сообщения со списком задач."""
+    def _block(
+        self,
+        title: str,
+        tasks: list[dict[str, Any]],
+        *,
+        empty: str | None = None,
+        group_days: bool = True,
+    ) -> str:
+        """Секция сообщения со списком задач.
+
+        `group_days=False` ставится там, где заголовок блока уже называет день
+        («Сегодня»): иначе над списком встали бы два одинаковых заголовка.
+        """
         if not tasks:
             return f"<b>{title}</b>\n<i>{empty or 'Пусто.'}</i>"
-        body = formatting.task_list(tasks, self.settings.tz)
+        body = formatting.task_list(tasks, self.settings.tz, group_days=group_days)
         return f"<b>{title}</b>\n{body}"
+
+    def _legend(self, *groups: list[dict[str, Any]]) -> list[str]:
+        """Расшифровка кружков срочности — одной строкой на всё сообщение.
+
+        В дайджесте блоков три, и раньше каждый заканчивался одной и той же
+        подписью. Считаем её здесь по всем делам сразу: в списке возвращаем
+        список, чтобы вызывающий мог просто сделать extend и не думать
+        о пустой строке, когда расшифровывать нечего.
+        """
+        legend = formatting.urgency_legend(
+            [task for group in groups for task in group], self.settings.tz
+        )
+        return [legend] if legend else []
 
     async def _send(self, text: str) -> bool:
         """Отправить сообщение владельцу. True — доставлено."""

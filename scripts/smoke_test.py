@@ -33,8 +33,18 @@ os.environ.update(
     DEFAULT_REMIND_OFFSETS="10080,1440,60",
 )
 
-from bot import calendar_export, db, formatting, llm, progress, recurrence, timeutil  # noqa: E402
+from bot import (  # noqa: E402
+    calendar_export,
+    db,
+    formatting,
+    handlers,
+    llm,
+    progress,
+    recurrence,
+    timeutil,
+)
 from bot.config import get_settings  # noqa: E402
+from bot.scheduler import AssistantScheduler  # noqa: E402
 
 # Схема ДО появления новых фич: колонки recurrence и таблицы progress ещё нет.
 # Нужна, чтобы проверить миграции на копии боевой базы, а не на свежей —
@@ -103,6 +113,35 @@ def _raises(call) -> bool:
     except (ValueError, TypeError):
         return True
     return False
+
+
+class _FakeSent:
+    """Заглушка отправленного сообщения: запоминает, что через неё правили."""
+
+    def __init__(self, log: list[tuple[str, str]]) -> None:
+        self._log = log
+
+    async def edit_text(self, text: str, **kwargs) -> None:
+        self._log.append(("edit", text))
+
+
+class _FakeMessage:
+    """Заглушка входящего сообщения: запоминает, что через неё отправляли.
+
+    Нужна там, где проверяется последовательность обращений к Telegram
+    (StreamedReply), а сам Telegram не нужен — хватает двух методов.
+    """
+
+    def __init__(self, log: list[tuple[str, str]]) -> None:
+        self._log = log
+        # Аргументы отправки отдельно от текста: клавиатуру удобнее проверять
+        # по объекту, а не по строке в общем журнале.
+        self.kwargs: list[dict] = []
+
+    async def answer(self, text: str, **kwargs) -> _FakeSent:
+        self._log.append(("answer", text))
+        self.kwargs.append(kwargs)
+        return _FakeSent(self._log)
 
 
 async def main() -> None:
@@ -242,6 +281,66 @@ async def main() -> None:
           f"late={late} dropped={dropped}")
     await db.delete_task(stale_task["task"]["id"])
 
+    # Дело, заведённое незадолго до срока. Раньше такой оставался вообще без
+    # напоминаний: все смещения по умолчанию («за неделю», «за сутки», «за час»)
+    # уже в прошлом, и отбрасывались все до единого. Бот обещал напомнить и молчал.
+    soon = await llm.execute_tool("add_task", {
+        "title": "Созвон с репетитором",
+        "due_at_local": iso_local(now + timedelta(minutes=30), tz),
+        "category": "study",
+        "priority": "normal",
+    })
+    soon_id = soon["task"]["id"]
+    soon_row = await db.get_task(soon_id)
+    check("у близкого срока появилось страховочное напоминание",
+          len(soon_row["reminders"]) == 1, str(soon_row["reminders"]))
+    check("оно ещё не отправлено",
+          soon_row["reminders"] and soon_row["reminders"][0]["sent_at"] is None)
+
+    near, _ = await db.due_reminders(now + timedelta(minutes=25), timedelta(hours=6))
+    soon_pending = [item for item in near if item["task_id"] == soon_id]
+    check("страховочное напоминание срабатывает до срока",
+          len(soon_pending) == 1 and soon_pending[0]["late"] is False, str(soon_pending))
+
+    # Догоняющее напоминание: сервер полежал, напоминание просрочено сильнее
+    # grace-окна, но само дело ещё впереди. Раньше такое молча помечалось
+    # отправленным — и после ночного простоя напоминания просто исчезали.
+    late_task = await llm.execute_tool("add_task", {
+        "title": "Пробник IELTS",
+        "due_at_local": iso_local(now + timedelta(days=3), tz),
+        "category": "exams",
+        "priority": "high",
+    })
+    late_id = late_task["task"]["id"]
+    # Время «за час до срока»: «за сутки» к этому моменту просрочено на 23 часа.
+    far = now + timedelta(days=3) - timedelta(hours=1)
+    pending_late, dropped = await db.due_reminders(far, timedelta(hours=6))
+    late_items = [item for item in pending_late if item["task_id"] == late_id and item["late"]]
+    check("просроченное напоминание живого дела не выбрасывается",
+          len(late_items) == 1, str(pending_late))
+    check("и не помечается отправленным молча",
+          bool(late_items) and late_items[0]["reminder_id"] not in dropped, str(dropped))
+    check("догоняющее напоминание помечено в тексте",
+          bool(late_items) and "с задержкой" in formatting.render_reminder(late_items[0], tz),
+          formatting.render_reminder(late_items[0], tz) if late_items else "")
+
+    # А вот дело, чей срок уже прошёл, догонять поздно — только шум.
+    overdue_task = await llm.execute_tool("add_task", {
+        "title": "Разбор ошибок SAT",
+        "due_at_local": iso_local(now + timedelta(hours=2), tz),
+        "category": "exams",
+        "priority": "normal",
+    })
+    overdue_id = overdue_task["task"]["id"]
+    after, dropped = await db.due_reminders(now + timedelta(days=2), timedelta(hours=6))
+    check("просроченное дело не догоняем",
+          all(item["task_id"] != overdue_id for item in after), str(after))
+    check("его напоминание уходит в отброшенные, а не копится",
+          len(dropped) >= 1, str(dropped))
+
+    for extra in (soon_id, late_id, overdue_id):
+        await db.delete_task(extra)
+
     # ------------------------------------------------------------------ #
     section("5. Изменение и удаление")
     moved = await llm.execute_tool("update_task", {
@@ -277,10 +376,89 @@ async def main() -> None:
           ambiguous.get("ok") is False and "несколько" in ambiguous.get("error", ""), str(ambiguous))
 
     # ------------------------------------------------------------------ #
-    section("6. Рендер и HTML")
+    section("6. Рендер, HTML и потоковый ответ")
     remaining = await db.list_tasks(status="open", limit=10)
     rendered = formatting.task_list(remaining, tz)
     check("список отрендерен", "Air Astana" in rendered and f"#{flight['task']['id']}" in rendered)
+
+    # Вид списка: дни — заголовками, на дело — одна строка. Проверяем на
+    # собственном наборе, а не на состоянии базы: так видно и границы дней.
+    # Момент жёстко ставим на местный полдень: иначе проверки зависели бы от
+    # часа запуска — в 23:50 «через два часа» это уже завтрашний день.
+    moment = datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
+
+    def due_on(day_offset: int, hour: int) -> str:
+        """Срок на конкретном местном дне — от зафиксированного момента."""
+        day = (moment + timedelta(days=day_offset)).replace(hour=hour)
+        return day.astimezone(timezone.utc).isoformat()
+
+    sample = [
+        {"id": 1, "title": "Контрольная по физике", "category": "exams", "priority": "high",
+         "recurrence": None, "due_at": due_on(0, 14)},          # через 2 часа — горит
+        {"id": 2, "title": "Тренировка", "category": "sport", "priority": "normal",
+         "recurrence": "weekly:1,3", "due_at": due_on(1, 9)},   # завтра
+        {"id": 3, "title": "Пробник IELTS", "category": "exams", "priority": "high",
+         "recurrence": None, "due_at": due_on(2, 9)},           # послезавтра — уже спокойно
+        {"id": 4, "title": "Дедлайн документов", "category": "flight", "priority": "critical",
+         "recurrence": None, "due_at": due_on(40, 12)},
+        {"id": 5, "title": "Идеи для проекта", "category": "other", "priority": "low",
+         "recurrence": None, "due_at": None},
+    ]
+    listing = formatting.task_list(sample, tz, now=moment)
+    listing_lines = listing.splitlines()
+    check("дни идут заголовками",
+          "<b>Сегодня</b>" in listing and "<b>Завтра</b>" in listing
+          and listing.index("<b>Без срока</b>") > listing.index("<b>Завтра</b>"), listing)
+    check("на каждое дело ровно одна строка",
+          all(sum(f"#{task['id']}</code>" in line for line in listing_lines) == 1
+              for task in sample), listing)
+    rows = [line for line in listing_lines if line[:1] in {"🔴", "🟠", "⚪"}]
+    # Дело на послезавтра — уже ⚪, хотя до него меньше двух суток: «сегодня-
+    # завтра» считается по календарю, а не по окну в 48 часов.
+    check("кружок срочности соответствует сроку",
+          [row[0] for row in rows] == ["🔴", "🟠", "⚪", "⚪", "⚪"], str(rows))
+    check("повторяющееся дело помечено", "🔁" in listing, listing)
+    # Время уже стоит в начале строки, а близость срока показывает кружок —
+    # подпись «через 4 часа» под каждой строкой была тем же самым дважды.
+    check("будущий срок подписью не дублируется",
+          "<i>через" not in listing, listing)
+
+    # Просрочку из одного «09:00» не прочитать: это нынешнее утро или вчерашнее?
+    overdue_sample = [
+        {"id": 9, "title": "Разбор ошибок SAT", "category": "exams", "priority": "normal",
+         "recurrence": None, "due_at": (moment - timedelta(days=2)).isoformat()},
+    ]
+    overdue_line = formatting.task_list(overdue_sample, tz, now=moment)
+    check("у просроченного дела видно, на сколько опоздали",
+          "просрочено на 2 дня" in overdue_line, overdue_line)
+
+    # Расшифровка кружков — одна на сообщение, и только когда есть что объяснять.
+    check("расшифровка живёт в сообщении, а не в списке",
+          formatting.URGENCY_LEGEND not in listing, listing)
+    hot_legend = formatting.urgency_legend(sample, tz, now=moment)
+    check("легенда появляется, когда есть горящее",
+          formatting.URGENCY_LEGEND in hot_legend, hot_legend)
+    calm_sample = [dict(task, due_at=due_on(30, 12)) for task in sample]
+    check("когда всё спокойно, легенды нет",
+          formatting.urgency_legend(calm_sample, tz, now=moment) == "",
+          formatting.urgency_legend(calm_sample, tz, now=moment))
+
+    flat = formatting.task_list(sample, tz, group_days=False, now=moment)
+    check("без группировки заголовков дней нет",
+          "Сегодня" not in flat and "#1</code>" in flat, flat)
+
+    # В дайджесте блок уже назван «Сегодня» — второй такой заголовок был бы
+    # повтором. Бот здесь не нужен: _block работает только с настройками.
+    digest_block = AssistantScheduler(None, settings)._block(  # type: ignore[arg-type]
+        "Сегодня", sample[:1], group_days=False
+    )
+    check("заголовок блока не повторяется внутри списка",
+          digest_block.count("Сегодня") == 1, digest_block)
+
+    digest_legend = AssistantScheduler(None, settings)._legend(sample[:1], sample[2:3])  # type: ignore[arg-type]
+    check("в дайджесте расшифровка одна на сообщение",
+          len(digest_legend) == 1 and formatting.URGENCY_LEGEND in digest_legend[0],
+          str(digest_legend))
     flight_row = await db.get_task(flight["task"]["id"])
     check("карточка содержит детали и напоминания",
           "медкомиссия" in formatting.task_card(flight_row, tz))
@@ -288,6 +466,72 @@ async def main() -> None:
           formatting.sanitize_html("<b>жирный</b> и 5 < 7 & <script>")
           == "<b>жирный</b> и 5 &lt; 7 &amp; &lt;script&gt;",
           formatting.sanitize_html("<b>жирный</b> и 5 < 7 & <script>"))
+
+    # Потоковый ответ. Заглушки вместо Telegram: проверяем саму последовательность
+    # действий — когда создаётся сообщение, когда правится, когда не дублируется.
+    log: list[tuple[str, str]] = []
+    reply = handlers.StreamedReply(_FakeMessage(log))
+    await reply.push("▸ Записал контрольную.")
+    check("первый кусок создаёт сообщение",
+          [kind for kind, _ in log] == ["answer"], str(log))
+    await reply.finish("▸ Записал <b>контрольную</b>.")
+    check("финал правит то же сообщение, а второе не шлёт",
+          [kind for kind, _ in log] == ["answer", "edit"], str(log))
+    check("финал приходит уже с разметкой",
+          log[-1][1] == "▸ Записал <b>контрольную</b>.", str(log))
+
+    log = []
+    reply = handlers.StreamedReply(_FakeMessage(log))
+    await reply.push("Первое слово")
+    await reply.push("Первое слово и продолжение")
+    check("правки не чаще раза в паузу INTERVAL",
+          [kind for kind, _ in log] == ["answer"], str(log))
+
+    log = []
+    reply = handlers.StreamedReply(_FakeMessage(log))
+    await reply.push("Записал <b")
+    check("недописанный тег уходит текстом, а не ломает парсер",
+          log and log[0][1] == "Записал &lt;b", str(log))
+
+    log = []
+    reply = handlers.StreamedReply(_FakeMessage(log))
+    await reply.push("▸ Готово")
+    await reply.finish("▸ Готово")
+    check("уже показанное не отправляется второй раз",
+          [kind for kind, _ in log] == ["answer"], str(log))
+
+    log = []
+    reply = handlers.StreamedReply(_FakeMessage(log))
+    await reply.finish("▸ Готово без стрима")
+    check("без потока ответ уходит как обычно",
+          [kind for kind, _ in log] == ["answer"], str(log))
+
+    log = []
+    reply = handlers.StreamedReply(_FakeMessage(log))
+    await reply.push("начало")
+    await reply.finish("я" * 5000)
+    check("длинный финал бьётся на части",
+          [kind for kind, _ in log] == ["answer", "edit", "answer"], str([k for k, _ in log]))
+
+    # Команда /today целиком: день уже назван в шапке, поэтому второго заголовка
+    # дня внутри списка быть не должно, а кнопки закрытия — быть.
+    today_short = await llm.execute_tool("add_task", {
+        "title": "Разбор задач по физике",
+        "due_at_local": iso_local(now + timedelta(hours=4), tz),
+        "category": "study",
+        "priority": "normal",
+    })
+    today_id = today_short["task"]["id"]
+    fake = _FakeMessage([])
+    await handlers.cmd_today(fake)
+    shown = fake._log[0][1] if fake._log else ""
+    check("список /today без повторного заголовка дня",
+          "Сегодня ·" not in shown and "Разбор задач по физике" in shown, shown)
+    check("к списку приложены кнопки закрытия",
+          fake.kwargs and fake.kwargs[0].get("reply_markup") is not None, str(fake.kwargs))
+    rows = fake.kwargs[0]["reply_markup"].inline_keyboard if fake.kwargs else []
+    check("кнопки идут по три в ряд", all(len(row) <= 3 for row in rows), str(rows))
+    await db.delete_task(today_id)
 
     # ------------------------------------------------------------------ #
     section("7. История диалога")
@@ -419,6 +663,67 @@ async def main() -> None:
     })
     check("серию можно отключить",
           detached["ok"] and (await db.get_task(shifted["id"]))["recurrence"] is None, str(detached))
+
+    # Серия, закрытая с опозданием. Дело заводим через db.create_task, а не
+    # инструментом: llm.add_task прошедшую дату не примет, а «серия, чей срок
+    # был три дня назад» — это ровно то состояние, в котором ежедневная серия
+    # оказывается, если отметить её на следующее утро после срока.
+    stale = await db.create_task(
+        title="Английский",
+        due_at=now - timedelta(days=3),
+        category="study",
+        priority="normal",
+        offsets=settings.default_offsets,
+        recurrence="daily",
+    )
+    open_before_roll = len(await db.list_tasks(status="open", limit=50))
+    rolled = (await db.complete_task(stale["id"]))["next_task"]
+    check("серия, закрытая с опозданием, не уходит в прошлое",
+          rolled is not None and timeutil.parse_iso(rolled["due_at"]) > now,
+          str(rolled and rolled["due_at"]))
+    check("у следующего вхождения есть напоминания",
+          bool(rolled and rolled["reminders"]), str(rolled and rolled["reminders"]))
+    check("правило серии сохранилось",
+          rolled is not None and rolled["recurrence"] == "daily", str(rolled and rolled["recurrence"]))
+    # Три пропущенных дня не превращаются в три задачи: закрытая уходит,
+    # приходит одна следующая, и число открытых дел не меняется.
+    check("пропущенные вхождения не создаются пачкой",
+          len(await db.list_tasks(status="open", limit=50)) == open_before_roll,
+          "серия размножилась")
+
+    # Перенос срока в прошлое раньше снимал с дела все напоминания и проходил
+    # молча — модель отвечала «перенёс», а напоминать было уже нечего.
+    guarded = await llm.execute_tool("update_task", {
+        "task_id": rolled["id"], "new_due_at_local": iso_local(now - timedelta(days=1), tz),
+    })
+    check("перенос срока в прошлое отклонён", guarded.get("ok") is False, str(guarded))
+    check("после отказа напоминания целы",
+          bool((await db.get_task(rolled["id"]))["reminders"]),
+          str((await db.get_task(rolled["id"]))["reminders"]))
+
+    # Серия, заведённая накануне: «за сутки» и «за неделю» при создании не
+    # поместились и отсеялись. Раньше этот огрызок набора переносился на все
+    # следующие вхождения, и «за сутки» у серии не срабатывало уже никогда.
+    near = await llm.execute_tool("add_task", {
+        "title": "Бассейн",
+        "due_at_local": iso_local(now + timedelta(hours=20), tz),
+        "category": "sport",
+        "recurrence": "weekly:1,3",
+    })
+    near_id = near["task"]["id"]
+    check("вблизи срока набор напоминаний урезан",
+          near["task"]["reminders_planned"] == ["за час"],
+          str(near["task"]["reminders_planned"]))
+    near_rolled = (await db.complete_task(near_id))["next_task"]
+    labels = [
+        formatting.reminder_label(int(item["offset_minutes"]))
+        for item in (near_rolled["reminders"] if near_rolled else [])
+    ]
+    check("к следующему вхождению набор напоминаний восстановлен",
+          "за сутки" in labels, str(labels))
+
+    for extra in (rolled["id"], near_rolled["id"] if near_rolled else 0):
+        await db.delete_task(extra)
 
     # ------------------------------------------------------------------ #
     section("10. Изображения")

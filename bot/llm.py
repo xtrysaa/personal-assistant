@@ -15,7 +15,7 @@ import base64
 import json
 import logging
 from datetime import datetime, time, timedelta
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from openai import AsyncOpenAI
 
@@ -32,6 +32,15 @@ HISTORY_LIMIT = 12
 
 # Максимум шагов «модель → инструмент → модель» в одном запросе.
 MAX_STEPS = 6
+
+# Потолок длины ответа. Стиль и так просит коротко, но без потолка модель
+# иногда уходит в простыню, а каждый лишний абзац — это ещё секунды ожидания.
+MAX_ANSWER_TOKENS = 900
+
+#: Колбэк, которым агент отдаёт наружу накопленный текст по мере генерации.
+#: Принимает ВЕСЬ текст, сказанный на текущем шаге, а не отдельный кусок:
+#: так получатель просто перерисовывает сообщение и не склеивает обрывки.
+DeltaHandler = Callable[[str], Awaitable[None]]
 
 # Старые напоминания (просроченные сильнее этого окна) не отправляем.
 REMINDER_GRACE = timedelta(hours=6)
@@ -291,6 +300,7 @@ async def run_agent(
     user_text: str,
     hint: str | None = None,
     images: Sequence[tuple[str, bytes]] = (),
+    on_delta: DeltaHandler | None = None,
 ) -> str:
     """Обработать сообщение пользователя и вернуть ответ ассистента.
 
@@ -300,6 +310,10 @@ async def run_agent(
     `images` — пары (mime, байты) приложенных картинок. В историю диалога
     уходит ТОЛЬКО текст: base64 в базе раздувал бы её без предела, а контекст
     от этого не выигрывает — расписание имеет смысл один раз, при разборе.
+
+    `on_delta` — необязательный получатель текста по мере генерации. С ним
+    ответ появляется в чате не целиком через 6 секунд, а по мере написания;
+    без него поведение ровно прежнее.
     """
     settings = get_settings()
     history = await db.get_history(limit=HISTORY_LIMIT)
@@ -315,31 +329,24 @@ async def run_agent(
     await db.add_message("user", user_text)
 
     for _ in range(MAX_STEPS):
-        response = await get_client().chat.completions.create(
-            model=settings.openai_model,
-            messages=messages,  # type: ignore[arg-type]
-            tools=TOOLS,  # type: ignore[arg-type]
-            tool_choice="auto",
-            temperature=0.2,
-        )
-        message = response.choices[0].message
+        message = await _ask_model(settings, messages, on_delta)
 
-        if not message.tool_calls:
-            answer = (message.content or "").strip() or "Не понял, повтори, пожалуйста."
+        if not message.get("tool_calls"):
+            answer = (message.get("content") or "").strip() or "Не понял, повторите, пожалуйста."
             await db.add_message("assistant", answer)
             return answer
 
         # Сообщение модели с запросами инструментов добавляем в переписку.
-        messages.append(message.model_dump(exclude_none=True))
+        messages.append(message)
 
-        for call in message.tool_calls:
-            arguments = _load_arguments(call.function.arguments)
-            logger.info("tool_call %s(%s)", call.function.name, arguments)
-            result = await execute_tool(call.function.name, arguments)
+        for call in message["tool_calls"]:
+            arguments = _load_arguments(call["function"]["arguments"])
+            logger.info("tool_call %s(%s)", call["function"]["name"], arguments)
+            result = await execute_tool(call["function"]["name"], arguments)
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": call.id,
+                    "tool_call_id": call["id"],
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 }
             )
@@ -347,6 +354,68 @@ async def run_agent(
     fallback = "Слишком много шагов подряд. Напишите, пожалуйста, запрос одним сообщением."
     await db.add_message("assistant", fallback)
     return fallback
+
+
+async def _ask_model(
+    settings: Settings, messages: list[dict[str, Any]], on_delta: DeltaHandler | None
+) -> dict[str, Any]:
+    """Один запрос к модели. Возвращает сообщение в формате OpenAI.
+
+    Читаем поток, а не готовый ответ: у flash-модели первые слова приходят
+    через секунду, а весь ответ — через пять. Без этого пользователь всё это
+    время видит только «печатает…» и считает, что бот завис.
+
+    Собираем сообщение вручную, а не через `chunk.choices[0].message`: при
+    стриминге модель отдаёт и текст, и аргументы инструментов кусками, и их
+    приходится склеивать самому.
+    """
+    stream = await get_client().chat.completions.create(
+        model=settings.openai_model,
+        messages=messages,  # type: ignore[arg-type]
+        tools=TOOLS,  # type: ignore[arg-type]
+        tool_choice="auto",
+        temperature=0.2,
+        max_tokens=MAX_ANSWER_TOKENS,
+        stream=True,
+    )
+
+    text_parts: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+
+        if delta.content:
+            text_parts.append(delta.content)
+            # Пока модель просит инструменты, показывать нечего: наружу уходит
+            # только настоящий ответ, который начнётся следующим шагом.
+            if on_delta is not None and not tool_calls:
+                await on_delta("".join(text_parts))
+
+        for fragment in delta.tool_calls or ():
+            slot = tool_calls.setdefault(
+                fragment.index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if fragment.id:
+                slot["id"] = fragment.id
+            if fragment.function is None:
+                continue
+            # Имя приходит один раз, аргументы — кусками JSON, которые надо
+            # склеить: json.loads на отдельном куске всегда падает.
+            if fragment.function.name:
+                slot["function"]["name"] = fragment.function.name
+            if fragment.function.arguments:
+                slot["function"]["arguments"] += fragment.function.arguments
+
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    return message
 
 
 def _build_user_content(
@@ -494,7 +563,11 @@ async def _tool_update_task(args: dict[str, Any], settings: Settings) -> dict[st
         changes["recurrence"] = _recurrence_arg(args["new_recurrence"])  # None = сделать разовой
 
     touch_due = bool(args.get("new_due_at_local"))
-    due_at = _parse_due(args["new_due_at_local"], settings, allow_past=True) if touch_due else None
+    # Прошлую дату не принимаем и здесь: перенос в прошлое снимал с дела все
+    # напоминания (все сроки срабатывания оказывались позади) и проходил молча —
+    # модель бодро отвечала «перенёс», а напоминать уже было нечего. Пусть лучше
+    # спросит про год, как и при создании дела.
+    due_at = _parse_due(args["new_due_at_local"], settings, allow_past=False) if touch_due else None
 
     raw_offsets = args.get("remind_offsets_minutes")
     offsets = tuple(int(offset) for offset in raw_offsets) if raw_offsets else None
