@@ -174,7 +174,7 @@ def get_settings() -> Settings:
         owner_id=owner_id,
         openai_api_key=openai_api_key,
         openai_base_url=openai_base_url,
-        openai_model=_optional("OPENAI_MODEL", "deepseek/deepseek-v4.1-flash"),
+        openai_model=_optional("OPENAI_MODEL", "openai/gpt-4.1-nano"),
         stt_api_key=stt_key or openai_api_key,
         stt_base_url=stt_base_url,
         # Groq отдаёт whisper-large-v3-turbo, официальный OpenAI — whisper-1.

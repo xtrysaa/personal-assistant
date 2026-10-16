@@ -137,22 +137,27 @@ PersonalAssistent/
 
 1. Зайди на **openrouter.ai** → Sign in → **Keys** → `Create Key`.
 2. Скопируй ключ `sk-or-v1-...` → это `OPENAI_API_KEY`.
-3. Проверь точный slug модели (на странице модели есть кнопка «Copy model slug»):
+3. Проверь точный slug модели (на странице модели есть кнопка «Copy model slug»).
+   Что вообще есть и почём — список моделей, умеющих вызывать инструменты, от дешёвых к дорогим:
 
 ```bash
-curl -s https://openrouter.ai/api/v1/models | python -c "import sys,json; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data'] if 'deepseek' in m['id']))"
+curl -s https://openrouter.ai/api/v1/models | python -c 'import sys,json
+d=json.load(sys.stdin)["data"]
+t=[m for m in d if "tools" in (m.get("supported_parameters") or [])]
+t.sort(key=lambda m: float(m["pricing"]["completion"]))
+print("\n".join(m["id"] for m in t[:20]))'
 ```
 
-   В проекте по умолчанию стоит `deepseek/deepseek-v4.1-flash` — это дешёвый и быстрый
-   вариант, который хорошо держит вызов инструментов.
+   В проекте по умолчанию стоит `openai/gpt-4.1-nano` — отвечает за 1–3 секунды,
+   хорошо держит вызов инструментов и стоит $0.10/$0.40 за миллион токенов.
 
-   ⚠️ Это **reasoning-модель**: перед ответом она думает, и токены размышлений
-   пишутся в тот же лимит `max_tokens`, что и сам ответ (на обычный запрос их
-   уходит 700–900). Поэтому в `bot/llm.py` потолок `MAX_ANSWER_TOKENS` держится
-   с запасом — 4000. Если его срезать, модель начинает возвращать пустое
-   сообщение или обрывать вызов инструмента на середине JSON, и в чате
-   появляется «Модель не дала ответа». Тот же потолок отвечает и за обрыв
-   `400 Tool calls cutoff by max_tokens` в логе.
+   ⚠️ Если поставишь **reasoning-модель** (например `deepseek/deepseek-v4.1-flash`,
+   `deepseek-v4-flash`), она перед ответом думает, и токены размышлений пишутся
+   в тот же лимит `max_tokens`, что и сам ответ (на обычный запрос их уходит
+   700–900, сложный план — до 2500). Отсюда две вещи: ответ ждётся 10–30 секунд
+   вместо 2, и при срезанном потолке модель возвращает пустое сообщение или
+   обрывает вызов инструмента на середине JSON. Поэтому `MAX_ANSWER_TOKENS` в
+   `bot/llm.py` держится с запасом — 4000.
 
 ### 2.2. Голосовые (Groq) — чтобы бот понимал голос
 
@@ -196,7 +201,7 @@ OWNER_TELEGRAM_ID=123456789              # твой id из @userinfobot
 
 OPENAI_API_KEY=sk-or-v1-...              # ключ OpenRouter
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
-OPENAI_MODEL=deepseek/deepseek-v4.1-flash
+OPENAI_MODEL=openai/gpt-4.1-nano
 
 STT_API_KEY=gsk_...                      # ключ Groq (для голосовых)
 
@@ -222,7 +227,7 @@ python run.py
 В логе должно появиться:
 
 ```
-INFO Бот запущен: @alnur_assistant_bot | часовой пояс: Asia/Almaty | модель: deepseek/deepseek-v4.1-flash | голосовые: включены
+INFO Бот запущен: @alnur_assistant_bot | часовой пояс: Asia/Almaty | модель: openai/gpt-4.1-nano | голосовые: включены
 ```
 
 Теперь напиши боту в Telegram — он должен ответить.
@@ -643,7 +648,7 @@ grep "База готова" /var/log/assistant-bot.log
 | Компонент | Цена |
 |---|---|
 | Oracle Cloud Always Free (ARM VM) | **0 ₽** навсегда |
-| OpenRouter + `deepseek/deepseek-v4.1-flash` | ~$0.0026 / млн входных, $0.60 / млн выходных токенов |
+| OpenRouter + `openai/gpt-4.1-nano` | ~$0.10 / млн входных, $0.40 / млн выходных токенов |
 | Groq Whisper for голосовых | бесплатный тариф |
 
 В реальности: обычное сообщение — это ~2–3 тыс. токенов промпта и пара сотен в ответе,
@@ -651,7 +656,7 @@ grep "База готова" /var/log/assistant-bot.log
 выходит порядка **$1–3 в месяц**. Проверить расход можно в личном кабинете OpenRouter.
 
 Хочешь совсем ноль — поставь бесплатную модель с пометкой `:free` в `OPENAI_MODEL`
-(например `deepseek/deepseek-v4.1-flash:free`, если доступна). Минус: такие модели
+(например `deepseek/deepseek-chat:free`, если доступна). Минус: такие модели
 медленнее и хуже держат вызов инструментов, что для трекера задач критично.
 
 ---
