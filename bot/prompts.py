@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .config import Settings
 from .timeutil import WEEKDAYS_SHORT
@@ -58,6 +58,8 @@ RULES = """
 3. Если из текста неясна дата или год (например «в субботу» без контекста или «15 ноября» без года) —
    выбери ближайшую будущую дату и коротко уточни её в ответе, чтобы он мог поправить.
 4. Прошлые даты не создавай: если дата в прошлом — верни ошибку и спроси, имелся ли в виду следующий год.
+   Месяцы сравнивайте по календарю, а не по числу в дате: «15 ноября» — это будущее
+   (ноябрь идёт после октября), хотя число 15 меньше сегодняшнего 16.
 5. Формулировки вроде «я устал», «что мне делать» без конкретного дела — это разговор, а не задача.
 6. После `add_task` ответь коротко: что записал, на когда и когда напомнишь.
    Про напоминания говорите ровно то, что вернул инструмент в `reminders_planned`.
@@ -118,6 +120,8 @@ TEMPLATE = """
 
 Сейчас: %WEEKDAY%, %NOW% (часовой пояс %TZ%).
 
+%CALENDAR%
+
 %PROFILE%
 
 %RULES%
@@ -126,16 +130,52 @@ TEMPLATE = """
 """.strip()
 
 
+def _calendar_hint(now_local: datetime) -> str:
+    """Таблица дат на две недели вперёд.
+
+    День недели в дату — самая частая арифметика этого ассистента: «в четверг»,
+    «в следующий вторник», «через две недели». Именно на ней и ошибаются
+    быстрые дешёвые модели: gpt-4o-mini поставил «созвон в четверг» на вторник
+    20 октября и сам же подписал его вторником, gpt-4.1-nano отправил «через
+    две недели» на 1 ноября вместо 30 октября. Готовый список снимает счёт
+    целиком: остаётся посмотреть в него, как в справочник.
+    """
+    today = now_local.date()
+    days = [
+        f"{WEEKDAYS_SHORT[day.weekday()]} {day:%d.%m}"
+        for day in (today + timedelta(days=offset) for offset in range(1, 15))
+    ]
+    week = today + timedelta(days=7)
+    fortnight = today + timedelta(days=14)
+    return (
+        "## Календарь ближайших двух недель\n"
+        f"Сегодня — {WEEKDAYS_SHORT[today.weekday()]}, {today:%d.%m.%Y}.\n"
+        f"{', '.join(days)}.\n"
+        f"Через неделю — {week:%d.%m}, через две недели — {fortnight:%d.%m}.\n"
+        "День недели берите из этого списка, а не считайте в уме: «в четверг» — ближайший\n"
+        "четверг из списка, «в следующий вторник» — первый вторник из списка.\n"
+        "«Через неделю» и «через две недели» — тоже готовые даты из строки выше:\n"
+        f"это {week:%d.%m} и {fortnight:%d.%m}, а не «примерно тот же день»."
+    )
+
+
 def build_system_prompt(settings: Settings) -> str:
-    """Собрать системный промпт с актуальными датой и часовым поясом."""
+    """Собрать системный промпт с актуальными датой и часовым поясом.
+
+    Порядок подстановок важен: сначала вставляются блоки текста, и только потом
+    значения вроде %TZ%. Наоборот не работает — `%TZ%` есть и внутри
+    TOOL_HINT, а он попадает в шаблон позже, и модель получала буквальное
+    «локальное время (%TZ%)» вместо часового пояса пользователя.
+    """
     now_local = datetime.now(settings.tz)
     return (
-        TEMPLATE.replace("%WEEKDAY%", _weekday_name(now_local))
-        .replace("%NOW%", now_local.strftime("%Y-%m-%d %H:%M"))
-        .replace("%TZ%", settings.tz_name)
+        TEMPLATE.replace("%CALENDAR%", _calendar_hint(now_local))
         .replace("%PROFILE%", PROFILE)
         .replace("%RULES%", RULES)
         .replace("%TOOL_HINT%", TOOL_HINT)
+        .replace("%WEEKDAY%", _weekday_name(now_local))
+        .replace("%NOW%", now_local.strftime("%Y-%m-%d %H:%M"))
+        .replace("%TZ%", settings.tz_name)
     )
 
 

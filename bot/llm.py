@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from datetime import datetime, time, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -37,20 +38,52 @@ MAX_STEPS = 6
 # Потолок длины ответа. Стиль и так просит коротко, но без потолка модель
 # иногда уходит в простыню, а каждый лишний абзац — это ещё секунды ожидания.
 #
-# Считается он ВМЕСТЕ с размышлениями: у reasoning-моделей (наш
-# deepseek/deepseek-v4.1-flash именно такая) токены рассуждений пишутся в тот
+# Считается он ВМЕСТЕ с размышлениями: у reasoning-моделей
+# (deepseek/deepseek-v4.1-flash и подобных) токены рассуждений пишутся в тот
 # же лимит, что и ответ, и на один разбор обычного запроса их уходит 700–900.
 # С прежним потолком в 900 на сам ответ не оставалось места, и получалось два
 # вида поломки: пустое сообщение (бот отвечал «Не понял, повторите, пожалуйста»
 # на совершенно ясный текст) и обрыв вызова инструмента на середине JSON —
 # провайдер на такое отвечает «400 Tool calls cutoff by max_tokens».
-# Потолок здесь не обязывает модель писать длинно: он только снимает обрез.
+# Модели по умолчанию (gpt-4o-mini) размышлений не тратят, и запас ей не
+# мешает: потолок не обязывает писать длинно, он только снимает обрез.
 MAX_ANSWER_TOKENS = 4000
 
 # Сколько раз переспросить модель, если шаг закончился без ответа и без вызова
 # инструмента. Обычно это следствие упёршегося в потолок вывода, и повторная
 # попытка проходит — но уж если и она пустая, честнее сказать, что случилось.
 EMPTY_REPLY_RETRIES = 1
+
+# Инструменты, которые меняют базу. Нужны, чтобы отличать настоящую запись от
+# рассказа о ней: быстрые дешёвые модели (gpt-4o-mini в замерах) отвечают
+# «Записал созвон на чт, 22 окт, 16:00» — дата названа верно, а add_task не
+# вызывался, и дела в базе нет. Пользователь узнаёт об этом в день созвона,
+# когда напоминание не придёт. Молчаливое враньё хуже медленного ответа,
+# поэтому проверяем и переспрашиваем.
+WRITING_TOOLS = frozenset(
+    {"add_task", "update_task", "complete_task", "delete_task", "log_score", "log_hours"}
+)
+
+# Сколько раз переспросить модель, объявившую результат без вызова инструмента.
+CLAIM_REPLIES_RETRIES = 1
+
+# Прошедшее время от глаголов-действий: так модель объявляет результат.
+# Инфинитивы («не могу записать») сюда не попадают — они ничего не обещают.
+_CLAIM_RE = re.compile(
+    r"\b(записал[аи]?|перен[её]сл?[аи]?|удалил[аи]?|отметил[аи]?|создал[аи]?|"
+    r"добавил[аи]?|поставил[аи]?|обновил[аи]?|изменил[аи]?|вн[её]с[лаи]*|"
+    r"added|saved|recorded|deleted|updated|scheduled|booked|logged|created)\b",
+    re.IGNORECASE,
+)
+
+_CLAIM_NUDGE = (
+    "В этом ответе вы объявили результат, но ни один инструмент записи не "
+    "выполнился успешно — в базе ничего не изменилось. Если действие "
+    "действительно нужно, вызовите инструмент (add_task, update_task, "
+    "complete_task, delete_task, log_score, log_hours) и только потом "
+    "говорите «Записал». Если действие не требуется — ответьте заново, не "
+    "утверждая, что что-то выполнено."
+)
 
 #: Колбэк, которым агент отдаёт наружу накопленный текст по мере генерации.
 #: Принимает ВЕСЬ текст, сказанный на текущем шаге, а не отдельный кусок:
@@ -344,7 +377,9 @@ async def run_agent(
     await db.add_message("user", user_text)
 
     retries_left = EMPTY_REPLY_RETRIES
+    claim_retries_left = CLAIM_REPLIES_RETRIES
     steps_ran_out = True
+    wrote_something = False
 
     for _ in range(MAX_STEPS):
         message, finish_reason = await _ask_model(settings, messages, on_delta)
@@ -357,6 +392,8 @@ async def run_agent(
                 arguments = _load_arguments(call["function"]["arguments"])
                 logger.info("tool_call %s(%s)", call["function"]["name"], arguments)
                 result = await execute_tool(call["function"]["name"], arguments)
+                if call["function"]["name"] in WRITING_TOOLS and result.get("ok"):
+                    wrote_something = True
                 messages.append(
                     {
                         "role": "tool",
@@ -368,6 +405,18 @@ async def run_agent(
 
         answer = (message.get("content") or "").strip()
         if answer:
+            # Ответ объявляет результат, а в базу ничего не попало. Это не
+            # косметика: пользователь поверит «Записал» и пропустит дело.
+            if not wrote_something and claim_retries_left and _CLAIM_RE.search(answer):
+                logger.warning(
+                    "Ответ обещает действие без вызова инструмента, переспрашиваю: %r",
+                    answer[:200],
+                )
+                claim_retries_left -= 1
+                messages.append({"role": "assistant", "content": answer})
+                messages.append({"role": "user", "content": _CLAIM_NUDGE})
+                continue
+
             await db.add_message("assistant", answer)
             return answer
 
