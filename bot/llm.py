@@ -11,13 +11,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 from datetime import datetime, time, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 
 from . import db, formatting, progress, recurrence, timeutil
 from .config import Settings, get_settings
@@ -35,7 +36,21 @@ MAX_STEPS = 6
 
 # Потолок длины ответа. Стиль и так просит коротко, но без потолка модель
 # иногда уходит в простыню, а каждый лишний абзац — это ещё секунды ожидания.
-MAX_ANSWER_TOKENS = 900
+#
+# Считается он ВМЕСТЕ с размышлениями: у reasoning-моделей (наш
+# deepseek/deepseek-v4.1-flash именно такая) токены рассуждений пишутся в тот
+# же лимит, что и ответ, и на один разбор обычного запроса их уходит 700–900.
+# С прежним потолком в 900 на сам ответ не оставалось места, и получалось два
+# вида поломки: пустое сообщение (бот отвечал «Не понял, повторите, пожалуйста»
+# на совершенно ясный текст) и обрыв вызова инструмента на середине JSON —
+# провайдер на такое отвечает «400 Tool calls cutoff by max_tokens».
+# Потолок здесь не обязывает модель писать длинно: он только снимает обрез.
+MAX_ANSWER_TOKENS = 4000
+
+# Сколько раз переспросить модель, если шаг закончился без ответа и без вызова
+# инструмента. Обычно это следствие упёршегося в потолок вывода, и повторная
+# попытка проходит — но уж если и она пустая, честнее сказать, что случилось.
+EMPTY_REPLY_RETRIES = 1
 
 #: Колбэк, которым агент отдаёт наружу накопленный текст по мере генерации.
 #: Принимает ВЕСЬ текст, сказанный на текущем шаге, а не отдельный кусок:
@@ -328,38 +343,88 @@ async def run_agent(
 
     await db.add_message("user", user_text)
 
-    for _ in range(MAX_STEPS):
-        message = await _ask_model(settings, messages, on_delta)
+    retries_left = EMPTY_REPLY_RETRIES
+    steps_ran_out = True
 
-        if not message.get("tool_calls"):
-            answer = (message.get("content") or "").strip() or "Не понял, повторите, пожалуйста."
+    for _ in range(MAX_STEPS):
+        message, finish_reason = await _ask_model(settings, messages, on_delta)
+
+        if message.get("tool_calls"):
+            # Сообщение модели с запросами инструментов добавляем в переписку.
+            messages.append(message)
+
+            for call in message["tool_calls"]:
+                arguments = _load_arguments(call["function"]["arguments"])
+                logger.info("tool_call %s(%s)", call["function"]["name"], arguments)
+                result = await execute_tool(call["function"]["name"], arguments)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    }
+                )
+            continue
+
+        answer = (message.get("content") or "").strip()
+        if answer:
             await db.add_message("assistant", answer)
             return answer
 
-        # Сообщение модели с запросами инструментов добавляем в переписку.
-        messages.append(message)
+        # Пустой шаг: ни ответа, ни вызова инструментов. Списывать это на
+        # пользователя («не понял, повторите») нельзя — он написал понятную
+        # вещь, а промолчала модель. Поэтому сначала переспрашиваем, и только
+        # если и вторая попытка пуста — называем причину прямо.
+        logger.warning(
+            "Шаг без ответа и без инструментов (finish_reason=%s), повторов осталось: %d",
+            finish_reason,
+            retries_left,
+        )
+        if retries_left:
+            retries_left -= 1
+            continue
 
-        for call in message["tool_calls"]:
-            arguments = _load_arguments(call["function"]["arguments"])
-            logger.info("tool_call %s(%s)", call["function"]["name"], arguments)
-            result = await execute_tool(call["function"]["name"], arguments)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
-                }
-            )
+        steps_ran_out = False
+        break
 
-    fallback = "Слишком много шагов подряд. Напишите, пожалуйста, запрос одним сообщением."
+    if steps_ran_out:
+        fallback = "Слишком много шагов подряд. Напишите, пожалуйста, запрос одним сообщением."
+    else:
+        fallback = (
+            "▸ Модель не дала ответа — судя по всему, упёрлась в потолок вывода.\n"
+            "Повторите, пожалуйста, запрос. Дела при этом в порядке: они в базе, а не в диалоге."
+        )
     await db.add_message("assistant", fallback)
     return fallback
 
 
 async def _ask_model(
     settings: Settings, messages: list[dict[str, Any]], on_delta: DeltaHandler | None
-) -> dict[str, Any]:
-    """Один запрос к модели. Возвращает сообщение в формате OpenAI.
+) -> tuple[dict[str, Any], str | None]:
+    """Один запрос к модели с одной повторной попыткой на сбой провайдера.
+
+    Возвращает сообщение в формате OpenAI и `finish_reason` отдельно: он нужен,
+    чтобы отличить нормальный конец от обрыва по лимиту вывода (в логе видно
+    `length`). Положить его внутрь сообщения нельзя — сообщение уходит обратно
+    в следующий запрос, и лишний ключ провайдер не примет.
+    """
+    try:
+        return await _stream_model(settings, messages, on_delta)
+    except APIError as exc:
+        # Один и тот же slug провайдеры отдают по-разному: у одного запрос
+        # проходит, у другого рвётся на середине потока (например
+        # «Tool calls cutoff by max_tokens» от BaseTen). Вторая попытка обычно
+        # уходит на другой upstream — это дешевле, чем показать пользователю
+        # «связь потеряна» на ровном месте.
+        logger.warning("Сбой провайдера модели, повторяю запрос: %s", exc)
+        await asyncio.sleep(1.0)
+        return await _stream_model(settings, messages, on_delta)
+
+
+async def _stream_model(
+    settings: Settings, messages: list[dict[str, Any]], on_delta: DeltaHandler | None
+) -> tuple[dict[str, Any], str | None]:
+    """Прочитать один поток модели и собрать из него сообщение.
 
     Читаем поток, а не готовый ответ: у flash-модели первые слова приходят
     через секунду, а весь ответ — через пять. Без этого пользователь всё это
@@ -367,7 +432,9 @@ async def _ask_model(
 
     Собираем сообщение вручную, а не через `chunk.choices[0].message`: при
     стриминге модель отдаёт и текст, и аргументы инструментов кусками, и их
-    приходится склеивать самому.
+    приходится склеивать самому. Токены рассуждений (`delta.reasoning` у
+    OpenRouter, `reasoning_content` у DeepSeek напрямую) при этом просто не
+    собираем: пользователю нужен ответ, а не мысли модели о нём.
     """
     stream = await get_client().chat.completions.create(
         model=settings.openai_model,
@@ -381,11 +448,15 @@ async def _ask_model(
 
     text_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
 
     async for chunk in stream:
         if not chunk.choices:
             continue
-        delta = chunk.choices[0].delta
+        choice = chunk.choices[0]
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+        delta = choice.delta
         if delta is None:
             continue
 
@@ -415,7 +486,7 @@ async def _ask_model(
     message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
-    return message
+    return message, finish_reason
 
 
 def _build_user_content(
